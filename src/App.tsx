@@ -55,8 +55,26 @@ export default function App() {
         // fallback
       }
     } else if (config.videoSource.type === 'file' && config.videoSource.urlOrFile instanceof File) {
-      url = URL.createObjectURL(config.videoSource.urlOrFile);
-      title = config.videoSource.urlOrFile.name.replace(/\.[^/.]+$/, '');
+      const file = config.videoSource.urlOrFile;
+      url = URL.createObjectURL(file);
+      title = file.name.replace(/\.[^/.]+$/, '');
+
+      // Also upload to server so server FFmpeg can trim 4K parts effortlessly
+      try {
+        const uploadRes = await fetch('/api/upload-video', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'x-filename': file.name,
+          },
+          body: file,
+        });
+        if (uploadRes.ok) {
+          const upData = await uploadRes.json();
+          if (upData.url) url = upData.url;
+          if (upData.duration) duration = upData.duration;
+        }
+      } catch {}
     }
 
     const newMeta: VideoMetadata = {
