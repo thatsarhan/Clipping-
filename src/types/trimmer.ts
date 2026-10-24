@@ -8,6 +8,9 @@ export interface ClipSegment {
   notes?: string;
   hasCensorBleep?: boolean;
   censorRanges?: { start: number; end: number }[]; // seconds relative to clip start
+  videoBlobUrl?: string; // in-memory Blob URL of the actual trimmed video
+  serverClipUrl?: string; // direct endpoint to the trimmed MP4
+  fileSize?: number; // bytes of the trimmed video
 }
 
 export type VideoSourceType = 'youtube' | 'file' | 'sample';
@@ -47,6 +50,7 @@ export interface VideoMetadata {
   aspectRatio?: '16:9' | '9:16' | '1:1';
   resolution?: string; // e.g. "4K 2160p", "1080p"
   is4K?: boolean;
+  sessionId?: string;
 }
 
 export interface SplitPreset {

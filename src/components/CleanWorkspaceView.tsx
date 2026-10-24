@@ -21,15 +21,18 @@ export const CleanWorkspaceView: React.FC<CleanWorkspaceViewProps> = ({
   onBackToSetup,
 }) => {
   const [isZippingAll, setIsZippingAll] = useState(false);
+  const [zipProgress, setZipProgress] = useState(0);
 
   const handleDownloadAll = async () => {
     setIsZippingAll(true);
+    setZipProgress(10);
     try {
-      await downloadAllClipsZip(videoMeta, clips);
+      await downloadAllClipsZip(videoMeta, clips, (p) => setZipProgress(p));
     } catch (e) {
       console.error(e);
     } finally {
       setIsZippingAll(false);
+      setZipProgress(0);
     }
   };
 
@@ -71,7 +74,7 @@ export const CleanWorkspaceView: React.FC<CleanWorkspaceViewProps> = ({
           className="flex items-center gap-2 px-6 py-3 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 active:scale-[0.99] text-white text-sm font-bold rounded-xl shadow-lg shadow-emerald-600/25 transition-all cursor-pointer disabled:opacity-50"
         >
           <FolderArchive className="w-4 h-4" />
-          <span>{isZippingAll ? 'Packaging ZIP...' : `Download All (${clips.length} Clips)`}</span>
+          <span>{isZippingAll ? `Packaging ZIP (${zipProgress}%)...` : `Download All (${clips.length} Clips)`}</span>
         </button>
       </div>
 
