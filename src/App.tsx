@@ -9,18 +9,17 @@ import {
   Youtube,
   Download,
   Layers,
-  Sparkles,
-  Sliders,
-  Settings,
-  HelpCircle,
+  ArrowLeft,
   FolderArchive,
   Terminal,
   ShieldCheck,
   Check,
   Play,
+  RotateCcw,
+  Sparkles,
 } from 'lucide-react';
 import { Header } from './components/Header';
-import { UrlInputBar } from './components/UrlInputBar';
+import { SetupWizardView } from './components/SetupWizardView';
 import { VideoPlayerView } from './components/VideoPlayerView';
 import { TimelineTrimmer } from './components/TimelineTrimmer';
 import { DurationSlicerControl } from './components/DurationSlicerControl';
@@ -42,28 +41,26 @@ import {
   generateYtDlpCommand,
 } from './utils/trimmerLogic';
 import {
-  createRenderedClipVideo,
-  exportVideoSegmentFromElement,
-  triggerDownload,
+  downloadRealClip,
   triggerTextDownload,
   downloadAllClipsZip,
 } from './utils/videoExporter';
 
 export default function App() {
-  // Active Video State - Default to an engaging sample so the app is immediately interactive!
+  // Screen Management: 'setup' (Screen 1) or 'workspace' (Screen 2)
+  const [currentScreen, setCurrentScreen] = useState<'setup' | 'workspace'>('setup');
+
+  // Video and Configuration State
   const [videoMeta, setVideoMeta] = useState<VideoMetadata>(SAMPLE_VIDEOS[0]);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [activeClipId, setActiveClipId] = useState<string | null>(null);
 
-  // Slicing & Quality State
-  const [sliceSeconds, setSliceSeconds] = useState<number>(120); // 2 minutes default requested
-  const [selectedPlatform, setSelectedPlatform] = useState<PlatformFormat>('youtube');
-  const [selectedQuality, setSelectedQuality] = useState<VideoQuality>('4k'); // 4K requested!
+  const [sliceSeconds, setSliceSeconds] = useState<number>(30); // 30s Shorts default
+  const [selectedPlatform, setSelectedPlatform] = useState<PlatformFormat>('shorts');
+  const [selectedQuality, setSelectedQuality] = useState<VideoQuality>('4k');
 
   // Clips Collection
-  const [clips, setClips] = useState<ClipSegment[]>(() =>
-    generateEqualSegments(SAMPLE_VIDEOS[0].duration, 120, { titlePrefix: 'Part' })
-  );
+  const [clips, setClips] = useState<ClipSegment[]>([]);
 
   // Download & Rendering Progress
   const [downloadingClipId, setDownloadingClipId] = useState<string | null>(null);
@@ -75,10 +72,10 @@ export default function App() {
   const [isGuideModalOpen, setIsGuideModalOpen] = useState(false);
   const [censorRanges, setCensorRanges] = useState<{ start: number; end: number }[]>([]);
 
-  // Ref to video element for canvas recording & capture
+  // Ref to video element
   const videoElementRef = useRef<HTMLVideoElement | null>(null);
 
-  // Re-generate clips whenever duration or slice length changes
+  // Auto-slice helper
   const applyEqualSlice = useCallback(
     (durationSec: number, targetTotalDur = videoMeta.duration) => {
       const isShorts = durationSec <= 60 && (selectedPlatform === 'shorts' || selectedPlatform === 'tiktok');
@@ -108,90 +105,60 @@ export default function App() {
     [videoMeta.duration, selectedPlatform, censorRanges]
   );
 
-  // Handle YouTube URL load
-  const handleLoadYouTube = (url: string, autoSplitMinutes: number) => {
+  // SCREEN 1 -> SCREEN 2 TRANSITION: Proceed
+  const handleProceedFromSetup = async (config: {
+    videoSource: { type: 'youtube' | 'file' | 'sample'; urlOrFile: string | File; meta?: Partial<VideoMetadata> };
+    platform: PlatformFormat;
+    quality: VideoQuality;
+    sliceSeconds: number;
+  }) => {
     setIsLoadingVideo(true);
-    const videoId = extractYouTubeId(url);
 
-    // Simulated / fallback metadata fetch (10 minutes default if not yet known)
-    const estimatedDuration = 600; // 10 minutes
+    setSelectedPlatform(config.platform);
+    setSelectedQuality(config.quality);
+    setSliceSeconds(config.sliceSeconds);
+
+    let duration = config.videoSource.meta?.duration || 600;
+    let title = config.videoSource.meta?.title || 'Video';
+    let url = typeof config.videoSource.urlOrFile === 'string' ? config.videoSource.urlOrFile : '';
+
+    if (config.videoSource.type === 'youtube' && url) {
+      try {
+        // Try fetching real video info from server
+        const infoRes = await fetch(`/api/video-info?url=${encodeURIComponent(url)}`);
+        if (infoRes.ok) {
+          const infoData = await infoRes.json();
+          if (infoData.duration) duration = infoData.duration;
+          if (infoData.title) title = infoData.title;
+        }
+      } catch {
+        // fallback
+      }
+    } else if (config.videoSource.type === 'file' && config.videoSource.urlOrFile instanceof File) {
+      url = URL.createObjectURL(config.videoSource.urlOrFile);
+      title = config.videoSource.urlOrFile.name.replace(/\.[^/.]+$/, '');
+    }
+
     const newMeta: VideoMetadata = {
-      id: videoId || `yt_${Date.now()}`,
-      type: 'youtube',
-      title: `YouTube Video (${videoId || 'Clip'})`,
+      id: `vid_${Date.now()}`,
+      type: config.videoSource.type,
+      title,
       url,
-      duration: estimatedDuration,
-      thumbnailUrl: videoId
-        ? `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
-        : undefined,
-      aspectRatio: '16:9',
-      resolution: '4K Ultra HD (2160p)',
-      is4K: true,
+      duration,
+      thumbnailUrl: config.videoSource.meta?.thumbnailUrl,
+      aspectRatio: config.platform === 'shorts' || config.platform === 'tiktok' ? '9:16' : '16:9',
+      resolution: config.quality === '4k' ? '4K Ultra HD (2160p)' : '1080p Full HD',
+      is4K: config.quality === '4k',
     };
 
     setVideoMeta(newMeta);
-    setCurrentTime(0);
-
-    const targetSec = autoSplitMinutes > 0 ? autoSplitMinutes * 60 : sliceSeconds;
-    setSliceSeconds(targetSec);
-    applyEqualSlice(targetSec, estimatedDuration);
+    applyEqualSlice(config.sliceSeconds, duration);
     setIsLoadingVideo(false);
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    setCurrentScreen('workspace'); // Move to Screen 2!
   };
 
-  // Handle local video file upload
-  const handleLoadFile = (file: File, autoSplitMinutes: number) => {
-    setIsLoadingVideo(true);
-    const objectUrl = URL.createObjectURL(file);
-
-    const tempVideo = document.createElement('video');
-    tempVideo.src = objectUrl;
-    tempVideo.preload = 'metadata';
-
-    tempVideo.onloadedmetadata = () => {
-      const dur = tempVideo.duration || 300;
-      const is4KVideo = tempVideo.videoWidth >= 3840 || tempVideo.videoHeight >= 2160;
-
-      const newMeta: VideoMetadata = {
-        id: `file_${Date.now()}`,
-        type: 'file',
-        title: file.name.replace(/\.[^/.]+$/, ''),
-        url: objectUrl,
-        duration: Math.round(dur),
-        aspectRatio: tempVideo.videoWidth < tempVideo.videoHeight ? '9:16' : '16:9',
-        resolution: is4KVideo ? '4K UHD (2160p)' : `${tempVideo.videoHeight || 1080}p`,
-        is4K: is4KVideo,
-      };
-
-      setVideoMeta(newMeta);
-      setCurrentTime(0);
-
-      const targetSec = autoSplitMinutes > 0 ? autoSplitMinutes * 60 : sliceSeconds;
-      setSliceSeconds(targetSec);
-      applyEqualSlice(targetSec, dur);
-      setIsLoadingVideo(false);
-    };
-
-    tempVideo.onerror = () => {
-      setIsLoadingVideo(false);
-    };
-  };
-
-  // Handle Sample Video Selection
-  const handleLoadSample = (sampleId: string, autoSplitMinutes?: number) => {
-    const sample = SAMPLE_VIDEOS.find((s) => s.id === sampleId) || SAMPLE_VIDEOS[0];
-    setVideoMeta({
-      ...sample,
-      resolution: '4K Ultra HD (2160p)',
-      is4K: true,
-    });
-    setCurrentTime(0);
-
-    const targetSec = autoSplitMinutes && autoSplitMinutes > 0 ? autoSplitMinutes * 60 : sliceSeconds;
-    setSliceSeconds(targetSec);
-    applyEqualSlice(targetSec, sample.duration);
-  };
-
-  // Handle Seek from timeline or cards
+  // Handle Seek
   const handleSeek = (time: number) => {
     setCurrentTime(time);
     if (videoElementRef.current) {
@@ -199,11 +166,11 @@ export default function App() {
     }
   };
 
-  // Add manual clip from In/Out range
-  const handleAddManualClip = (start: number, end: number, title?: string) => {
+  // Manual clip
+  const handleAddManualClip = (start: number, end: number, clipTitle?: string) => {
     const newClip: ClipSegment = {
       id: `clip_${Date.now()}`,
-      title: title || `Custom Clip #${clips.length + 1} (${formatTimestamp(start)} - ${formatTimestamp(end)})`,
+      title: clipTitle || `Custom Part #${clips.length + 1} (${formatTimestamp(start)} - ${formatTimestamp(end)})`,
       startTime: start,
       endTime: end,
       duration: Math.round((end - start) * 10) / 10,
@@ -213,22 +180,17 @@ export default function App() {
     setActiveClipId(newClip.id);
   };
 
-  // Update specific clip
   const handleUpdateClip = (clipId: string, updated: Partial<ClipSegment>) => {
     setClips((prev) =>
       prev.map((c) => (c.id === clipId ? { ...c, ...updated } : c))
     );
   };
 
-  // Delete specific clip
   const handleDeleteClip = (clipId: string) => {
     setClips((prev) => prev.filter((c) => c.id !== clipId));
-    if (activeClipId === clipId) {
-      setActiveClipId(null);
-    }
+    if (activeClipId === clipId) setActiveClipId(null);
   };
 
-  // Preview clip in player
   const handlePreviewClip = (clip: ClipSegment) => {
     setActiveClipId(clip.id);
     handleSeek(clip.startTime);
@@ -237,172 +199,181 @@ export default function App() {
     }
   };
 
-  // PROMINENT INDIVIDUAL DOWNLOAD HANDLER
+  // REAL VIDEO DOWNLOAD HANDLER (NO MORE BLACK SCREEN OR BEEP!)
   const handleDirectDownloadClip = async (clip: ClipSegment) => {
     setDownloadingClipId(clip.id);
     setDownloadProgress(10);
 
     try {
-      const is4K = selectedQuality === '4k' || selectedQuality === 'source';
-      const safeTitle = `${clip.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_${is4K ? '4K' : '1080p'}`;
-
-      // If we have direct video element (sample video or uploaded local file)
-      if (videoElementRef.current && videoMeta.type !== 'youtube') {
-        const blob = await exportVideoSegmentFromElement(
-          videoElementRef.current,
-          clip,
-          (prog) => setDownloadProgress(prog)
-        );
-        triggerDownload(blob, `${safeTitle}.webm`);
-      } else {
-        // For YouTube videos: render crisp 4K/1080p WebM card with timecode animation and audio
-        const blob = await createRenderedClipVideo(
-          videoMeta,
-          clip,
-          (prog) => setDownloadProgress(prog),
-          {
-            quality: selectedQuality,
-            platform: selectedPlatform,
-          }
-        );
-        triggerDownload(blob, `${safeTitle}.webm`);
-      }
+      await downloadRealClip(
+        videoMeta,
+        clip,
+        videoElementRef.current,
+        (p) => setDownloadProgress(p),
+        {
+          quality: selectedQuality,
+          platform: selectedPlatform,
+        }
+      );
     } catch (err) {
       console.error('Download error:', err);
     } finally {
       setTimeout(() => {
         setDownloadingClipId(null);
         setDownloadProgress(0);
-      }, 800);
+      }, 500);
     }
   };
 
-  // Batch Download all clips as zip
+  // Batch Zip download
   const handleDownloadAllZip = async () => {
     await downloadAllClipsZip(videoMeta, clips);
   };
 
-  // Export Shell script for full offline 4K downloading
+  // Export batch shell script
   const handleExportShellScript = () => {
-    const is4K = selectedQuality === '4k' || selectedQuality === 'source';
+    const is4K = selectedQuality === '4k';
     const lines = [
       '#!/bin/bash',
-      `# ClipCraft 4K Batch Downloader for: ${videoMeta.title}`,
-      `# Target Format: ${selectedPlatform.toUpperCase()} | Quality: ${selectedQuality.toUpperCase()}`,
-      `# Total Clips: ${clips.length}`,
+      `# ClipCraft 4K Batch Downloader: ${videoMeta.title}`,
+      `# Quality: ${selectedQuality.toUpperCase()} | Platform: ${selectedPlatform.toUpperCase()}`,
       '',
       ...clips.map((c, i) => {
         const safe = `part_${i + 1}_${c.title.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
         return generateYtDlpCommand(videoMeta.url, c.startTime, c.endTime, safe, is4K ? '4k' : '1080p');
       }),
       '',
-      'echo "All 4K clips downloaded successfully!"',
+      'echo "All clips downloaded!"',
     ];
 
-    triggerTextDownload(lines.join('\n'), `download_4k_clips_${Date.now()}.sh`);
+    triggerTextDownload(lines.join('\n'), `download_clips_${Date.now()}.sh`);
   };
 
-  // Active clip object lookup
   const activeClip = clips.find((c) => c.id === activeClipId) || null;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-red-500 selection:text-white">
-      {/* Top Navigation */}
+      {/* Top Header */}
       <Header
         onOpenHelp={() => setIsGuideModalOpen(true)}
-        onOpenSample={(id) => handleLoadSample(id)}
+        onOpenSample={(id) => {
+          const sample = SAMPLE_VIDEOS.find((s) => s.id === id) || SAMPLE_VIDEOS[0];
+          handleProceedFromSetup({
+            videoSource: { type: 'sample', urlOrFile: sample.url, meta: sample },
+            platform: 'shorts',
+            quality: '4k',
+            sliceSeconds: 30,
+          });
+        }}
         totalClips={clips.length}
       />
 
-      {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
-        {/* Step 1: Input URL / Sample Video / File Upload */}
-        <section aria-labelledby="url-input-section">
-          <UrlInputBar
-            onLoadYouTube={handleLoadYouTube}
-            onLoadFile={handleLoadFile}
-            onLoadSample={(id, mins) => handleLoadSample(id, mins)}
+      {/* SCREEN 1: Setup Wizard Screen */}
+      {currentScreen === 'setup' && (
+        <main className="flex-1">
+          <SetupWizardView
+            onProceed={handleProceedFromSetup}
             isLoading={isLoadingVideo}
           />
-        </section>
+        </main>
+      )}
 
-        {/* Quality & 4K Resolution Toolbar */}
-        <div className="bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span className="font-semibold text-white">4K UHD Quality Engine:</span>
-            <span className="text-slate-400">
-              Shorts &amp; parts are exported in matching source resolution up to 4K Ultra HD (2160p).
-            </span>
-          </div>
+      {/* SCREEN 2: Workspace & Video Slicer Studio */}
+      {currentScreen === 'workspace' && (
+        <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {/* Top Navigation & Video Info Banner with Prominent DOWNLOAD ALL */}
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-xl flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  window.scrollTo({ top: 0, behavior: 'instant' });
+                  setCurrentScreen('setup');
+                }}
+                className="flex items-center gap-1.5 px-3 py-2 bg-slate-950 hover:bg-slate-800 text-slate-300 hover:text-white rounded-xl border border-slate-800 text-xs font-medium transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>← New Video / Settings</span>
+              </button>
 
-          <div className="flex items-center gap-2">
-            <span className="text-slate-400">Export Quality:</span>
-            <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5">
-              {(['4k', '2k', '1080p'] as VideoQuality[]).map((q) => {
-                const isSelected = selectedQuality === q;
-                return (
-                  <button
-                    key={q}
-                    type="button"
-                    onClick={() => setSelectedQuality(q)}
-                    className={`px-2.5 py-1 rounded text-xs font-semibold uppercase tracking-wider transition-all cursor-pointer ${
-                      isSelected
-                        ? 'bg-red-600 text-white shadow-sm'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {q}
-                  </button>
-                );
-              })}
+              <div>
+                <h2 className="text-sm sm:text-base font-bold text-white truncate max-w-md">
+                  {videoMeta.title}
+                </h2>
+                <div className="flex items-center gap-2 text-xs text-slate-400 mt-0.5">
+                  <span className="font-mono">{formatTimestamp(videoMeta.duration)}</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-emerald-400 font-semibold">{selectedQuality.toUpperCase()} UHD</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-red-400 uppercase font-semibold">{selectedPlatform}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Prominent DOWNLOAD ALL Button right at top */}
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleExportShellScript}
+                className="flex items-center gap-1.5 px-3 py-2 bg-slate-950 hover:bg-slate-800 text-slate-300 text-xs font-medium rounded-xl border border-slate-800 transition-colors cursor-pointer"
+              >
+                <Terminal className="w-4 h-4 text-amber-400" />
+                <span>Script (.sh)</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleDownloadAllZip}
+                className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold rounded-xl shadow-lg shadow-emerald-600/25 transition-all cursor-pointer"
+                title="Download all clips packaged in a zip"
+              >
+                <FolderArchive className="w-4 h-4" />
+                <span>Download All ({clips.length} Clips)</span>
+              </button>
             </div>
           </div>
-        </div>
 
-        {/* Video Player & Timeline Section */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Video Player (Left on desktop) */}
-          <div className="lg:col-span-7 space-y-4">
-            <VideoPlayerView
-              metadata={videoMeta}
-              currentTime={currentTime}
-              onTimeUpdate={(t) => setCurrentTime(t)}
-              activeClip={activeClip}
-              videoElementRef={videoElementRef}
-              onDurationDetected={(dur) => {
-                setVideoMeta((prev) => ({ ...prev, duration: Math.round(dur) }));
-              }}
-            />
-          </div>
+          {/* Player & Duration Slider Studio */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            {/* Player View */}
+            <div className="lg:col-span-7 space-y-4">
+              <VideoPlayerView
+                metadata={videoMeta}
+                currentTime={currentTime}
+                onTimeUpdate={(t) => setCurrentTime(t)}
+                activeClip={activeClip}
+                videoElementRef={videoElementRef}
+                onDurationDetected={(dur) => {
+                  setVideoMeta((prev) => ({ ...prev, duration: Math.round(dur) }));
+                }}
+              />
+            </div>
 
-          {/* Interactive Duration Slicer & Platform Format Picker (Right on desktop) */}
-          <div className="lg:col-span-5 space-y-4">
-            <DurationSlicerControl
-              totalDuration={videoMeta.duration}
-              currentSliceSeconds={sliceSeconds}
-              onSliceSecondsChange={(sec) => {
-                setSliceSeconds(sec);
-                applyEqualSlice(sec);
-              }}
-              selectedPlatform={selectedPlatform}
-              onPlatformChange={(p) => {
-                setSelectedPlatform(p);
-                // If platform is shorts/tiktok, default to 30s or 60s
-                if (p === 'shorts' || p === 'tiktok') {
-                  if (sliceSeconds > 60) {
-                    setSliceSeconds(30);
-                    applyEqualSlice(30);
+            {/* Live Duration Slicer */}
+            <div className="lg:col-span-5 space-y-4">
+              <DurationSlicerControl
+                totalDuration={videoMeta.duration}
+                currentSliceSeconds={sliceSeconds}
+                onSliceSecondsChange={(sec) => {
+                  setSliceSeconds(sec);
+                  applyEqualSlice(sec);
+                }}
+                selectedPlatform={selectedPlatform}
+                onPlatformChange={(p) => {
+                  setSelectedPlatform(p);
+                  if (p === 'shorts' || p === 'tiktok') {
+                    if (sliceSeconds > 60) {
+                      setSliceSeconds(30);
+                      applyEqualSlice(30);
+                    }
                   }
-                }
-              }}
-              onApplySplit={(sec) => applyEqualSlice(sec)}
-            />
+                }}
+                onApplySplit={(sec) => applyEqualSlice(sec)}
+              />
+            </div>
           </div>
-        </div>
 
-        {/* Interactive Visual Timeline Scrub & Trimmer */}
-        <section aria-labelledby="timeline-trimmer-section">
+          {/* Interactive Timeline Trimmer */}
           <TimelineTrimmer
             totalDuration={videoMeta.duration}
             currentTime={currentTime}
@@ -417,10 +388,8 @@ export default function App() {
             }}
             onOpenCensorModal={() => setIsCensorModalOpen(true)}
           />
-        </section>
 
-        {/* Generated Clips List with Individual Download Buttons */}
-        <section aria-labelledby="clips-list-section">
+          {/* Generated Clip Parts with INDIVIDUAL DOWNLOAD BUTTONS */}
           <ClipsList
             clips={clips}
             videoMeta={videoMeta}
@@ -441,33 +410,8 @@ export default function App() {
             downloadingClipId={downloadingClipId}
             downloadProgress={downloadProgress}
           />
-        </section>
-      </main>
-
-      {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950 py-6 mt-12 text-center text-xs text-slate-500">
-        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold text-slate-300">ClipCraft Studio</span>
-            <span aria-hidden="true">·</span>
-            <span>YouTube Slicer, 4K Trimmer &amp; Individual Clip Downloader</span>
-          </div>
-          <div className="flex items-center gap-4 text-slate-400">
-            <button
-              onClick={() => setIsGuideModalOpen(true)}
-              className="hover:text-white transition-colors cursor-pointer"
-            >
-              Shortcuts &amp; Guide
-            </button>
-            <button
-              onClick={() => setIsCensorModalOpen(true)}
-              className="hover:text-white transition-colors cursor-pointer"
-            >
-              Audio Bleep Tool
-            </button>
-          </div>
-        </div>
-      </footer>
+        </main>
+      )}
 
       {/* Modals */}
       <CensorModal
@@ -477,7 +421,6 @@ export default function App() {
         totalDuration={videoMeta.duration}
         onSaveCensorRanges={(ranges) => {
           setCensorRanges(ranges);
-          // Re-apply to clips
           setClips((prev) =>
             prev.map((c) => ({
               ...c,

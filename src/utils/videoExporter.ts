@@ -134,143 +134,74 @@ export async function exportVideoSegmentFromElement(
 }
 
 /**
- * Creates a synthetic animated video preview card (WebM) for YouTube segments
- * This allows browser-side direct download even when YouTube cross-origin prevents raw frame scraping
+ * Download real trimmed clip
+ * First attempts server-side 4K trimming via /api/download-clip for YouTube URLs.
+ * If local element is provided, uses real HTML5 video canvas frame capture.
  */
-export async function createRenderedClipVideo(
+export async function downloadRealClip(
   videoMeta: VideoMetadata,
   clip: ClipSegment,
+  videoElement: HTMLVideoElement | null,
   onProgress: (progress: number) => void,
   options?: {
     quality?: '4k' | '2k' | '1080p' | '720p' | 'source';
     platform?: 'shorts' | 'tiktok' | 'instagram' | 'twitter' | 'youtube';
   }
-): Promise<Blob> {
-  return new Promise((resolve) => {
-    const isVertical = options?.platform === 'shorts' || options?.platform === 'tiktok';
-    const is4K = options?.quality === '4k' || options?.quality === 'source' || videoMeta.is4K;
+): Promise<void> {
+  const quality = options?.quality || (videoMeta.is4K ? '4k' : '1080p');
+  const platform = options?.platform || 'youtube';
+  const safeFilename = `${clip.title.replace(/[^a-zA-Z0-9_-]/g, '_')}_${quality}.mp4`;
 
-    const canvas = document.createElement('canvas');
-    if (isVertical) {
-      canvas.width = is4K ? 2160 : 1080;
-      canvas.height = is4K ? 3840 : 1920;
-    } else {
-      canvas.width = is4K ? 3840 : 1920;
-      canvas.height = is4K ? 2160 : 1080;
-    }
+  onProgress(15);
 
-    const ctx = canvas.getContext('2d')!;
-    const stream = canvas.captureStream(30);
+  // 1. If YouTube video, call backend endpoint to fetch and slice the real stream
+  if (videoMeta.type === 'youtube') {
+    onProgress(30);
+    const params = new URLSearchParams({
+      url: videoMeta.url,
+      start: clip.startTime.toString(),
+      end: clip.endTime.toString(),
+      quality,
+      format: platform,
+      title: clip.title,
+    });
 
-    // Audio tone
-    let audioTrack: MediaStreamTrack | null = null;
+    const apiUrl = `/api/download-clip?${params.toString()}`;
+
     try {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const audioCtx = new AudioCtx();
-      const dest = audioCtx.createMediaStreamDestination();
-      const osc = audioCtx.createOscillator();
-      const gain = audioCtx.createGain();
-      osc.frequency.value = 440;
-      gain.gain.value = 0.05;
-      osc.connect(gain);
-      gain.connect(dest);
-      osc.start();
-      audioTrack = dest.stream.getAudioTracks()[0];
-      if (audioTrack) stream.addTrack(audioTrack);
-    } catch {
-      // Audio not supported in environment
-    }
-
-    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-      ? 'video/webm;codecs=vp9'
-      : 'video/webm';
-
-    const recorder = new MediaRecorder(stream, { mimeType });
-    const chunks: BlobPart[] = [];
-
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
-
-    recorder.onstop = () => {
-      if (audioTrack) audioTrack.stop();
-      onProgress(100);
-      resolve(new Blob(chunks, { type: mimeType }));
-    };
-
-    recorder.start(100);
-
-    const totalSeconds = Math.min(clip.duration, 5); // Render first 5s preview fast in browser
-    const startTime = Date.now();
-
-    const render = () => {
-      const elapsed = (Date.now() - startTime) / 1000;
-      if (elapsed >= totalSeconds) {
-        recorder.stop();
+      const response = await fetch(apiUrl);
+      if (response.ok) {
+        onProgress(80);
+        const blob = await response.blob();
+        onProgress(100);
+        triggerDownload(blob, safeFilename);
         return;
       }
+    } catch (e) {
+      console.warn('Backend download-clip failed, trying fallback stream...', e);
+    }
+  }
 
-      // Draw slick dark studio card
-      const grad = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
-      grad.addColorStop(0, '#0f172a');
-      grad.addColorStop(1, '#020617');
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // 2. If we have a real HTML5 video element (uploaded file or direct MP4 sample)
+  if (videoElement) {
+    onProgress(25);
+    const blob = await exportVideoSegmentFromElement(
+      videoElement,
+      clip,
+      (p) => onProgress(Math.max(25, Math.min(98, p)))
+    );
+    onProgress(100);
+    triggerDownload(blob, safeFilename);
+    return;
+  }
 
-      // Accent header bar
-      ctx.fillStyle = clip.color || '#3b82f6';
-      ctx.fillRect(0, 0, canvas.width, 8);
-
-      // Title & Part info
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 44px Inter, system-ui, sans-serif';
-      ctx.fillText(clip.title, 80, 160);
-
-      ctx.fillStyle = '#94a3b8';
-      ctx.font = '24px Inter, system-ui, sans-serif';
-      ctx.fillText(`Source: ${videoMeta.title}`, 80, 220);
-
-      // Timecode box
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-      ctx.roundRect(80, 280, 520, 120, 16);
-      ctx.fill();
-
-      ctx.fillStyle = '#38bdf8';
-      ctx.font = 'bold 36px monospace';
-      ctx.fillText(
-        `${formatTimestamp(clip.startTime)}  ➔  ${formatTimestamp(clip.endTime)}`,
-        110,
-        350
-      );
-
-      ctx.fillStyle = '#64748b';
-      ctx.font = '18px monospace';
-      ctx.fillText(`Duration: ${clip.duration}s (${formatTimestamp(clip.duration)})`, 110, 380);
-
-      // Animated playback wave
-      ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 4;
-      ctx.beginPath();
-      for (let x = 80; x < canvas.width - 80; x += 10) {
-        const y =
-          520 + Math.sin((x / 30) + elapsed * 5) * 40 * Math.sin(elapsed * 2);
-        if (x === 80) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-
-      // Timestamp watermark
-      const currentClipSec = clip.startTime + elapsed;
-      ctx.fillStyle = '#e2e8f0';
-      ctx.font = 'bold 20px monospace';
-      ctx.fillText(`PLAYHEAD: ${formatTimestamp(currentClipSec, true)}`, 80, 620);
-
-      onProgress(Math.round((elapsed / totalSeconds) * 95));
-      requestAnimationFrame(render);
-    };
-
-    render();
-  });
+  // 3. Fallback: trigger direct stream or script
+  onProgress(100);
+  const command = generateYtDlpCommand(videoMeta.url, clip.startTime, clip.endTime, safeFilename, quality);
+  triggerTextDownload(
+    `# 4K Clip Downloader Command\n${command}\n`,
+    `download_${safeFilename}.sh`
+  );
 }
 
 /**
