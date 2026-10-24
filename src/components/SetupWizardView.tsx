@@ -263,11 +263,15 @@ export const SetupWizardView: React.FC<SetupWizardViewProps> = ({
                       : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
                   }`}
                 >
-                  <img
-                    src={s.thumbnailUrl}
-                    alt={s.title}
-                    className="w-full aspect-video rounded-lg object-cover mb-2"
-                  />
+                  <div className="w-full aspect-video rounded-lg overflow-hidden bg-slate-900 border border-slate-800/80 mb-2 relative flex items-center justify-center">
+                    <img
+                      src={s.thumbnailUrl}
+                      alt={s.title}
+                      onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                      className="w-full h-full object-cover relative z-10"
+                    />
+                    <PlayCircle className="w-8 h-8 text-slate-700 absolute inset-0 m-auto" />
+                  </div>
                   <h4 className="text-xs font-semibold text-white line-clamp-1">{s.title}</h4>
                   <p className="text-[11px] text-slate-400">{Math.floor(s.duration / 60)} minutes · 4K</p>
                 </div>

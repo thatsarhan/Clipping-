@@ -199,6 +199,7 @@ export const UrlInputBar: React.FC<UrlInputBarProps> = ({
                   <img
                     src={sample.thumbnailUrl}
                     alt={sample.title}
+                    onError={(e) => { e.currentTarget.style.display = 'none'; }}
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                   />
                   <div className="absolute inset-0 bg-black/40 group-hover:bg-black/20 flex items-center justify-center transition-colors">

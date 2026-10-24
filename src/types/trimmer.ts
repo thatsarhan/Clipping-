@@ -10,6 +10,7 @@ export interface ClipSegment {
   censorRanges?: { start: number; end: number }[]; // seconds relative to clip start
   videoBlobUrl?: string; // in-memory Blob URL of the actual trimmed video
   serverClipUrl?: string; // direct endpoint to the trimmed MP4
+  thumbnailUrl?: string; // direct real frame thumbnail URL
   fileSize?: number; // bytes of the trimmed video
 }
 

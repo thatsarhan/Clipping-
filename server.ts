@@ -261,15 +261,15 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
       return;
     }
 
-    // YouTube URL -> Download with yt-dlp with node JS runtime
-    const ytCmd = `yt-dlp --js-runtimes node -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best" --no-playlist "${url}" -o "${rawTempVideo}"`;
-    exec(ytCmd, { maxBuffer: 30 * 1024 * 1024, timeout: 60000 }, (err) => {
+    // YouTube URL -> High-compatibility download using autoclip player_client args
+    const ytCmd = `yt-dlp --js-runtimes node --extractor-args "youtube:player_client=android,web,tv" -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best" --merge-output-format mp4 --no-playlist --no-warnings "${url}" -o "${rawTempVideo}"`;
+    exec(ytCmd, { maxBuffer: 50 * 1024 * 1024, timeout: 60000 }, (err) => {
       let candidate: string | null = null;
       if (fs.existsSync(rawTempVideo) && fs.statSync(rawTempVideo).size > 10000) {
         candidate = rawTempVideo;
       } else {
         const files = fs.readdirSync(sessionDir);
-        const match = files.find((f) => f.startsWith('source_raw') && !f.endsWith('.part'));
+        const match = files.find((f) => (f.startsWith('source_raw') || f.endsWith('.mp4')) && !f.endsWith('.part'));
         if (match) {
           candidate = path.join(sessionDir, match);
         }
@@ -283,66 +283,16 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
     });
   };
 
-  fetchSource((err, sourcePath) => {
+  fetchSource(async (err, sourcePath) => {
     if (err || !sourcePath || !fs.existsSync(sourcePath)) {
-      console.warn('Source fetch failed, generating synthesized parts fallback...', err);
-      // Fallback: create high-res video parts with thumbnail & audio
-      const ytId = extractYouTubeId(url);
-      const thumb = ytId ? `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg` : null;
-
-      const totalSec = 180; // 3-minute standard preview (6 parts of 30s)
-      const partCount = Math.ceil(totalSec / sliceSeconds);
-      const generatedParts: {
-        index: number;
-        title: string;
-        startTime: number;
-        endTime: number;
-        duration: number;
-        downloadUrl: string;
-        streamUrl: string;
-        size: number;
-      }[] = [];
-
-      let completed = 0;
-      for (let i = 0; i < partCount; i++) {
-        const start = i * sliceSeconds;
-        const end = Math.min(totalSec, (i + 1) * sliceSeconds);
-        const partDuration = end - start;
-        const partFile = path.join(sessionDir, `part_${i + 1}.mp4`);
-
-        generateSyntheticClip(thumb, partDuration, isVertical, partFile, (gErr, fPath) => {
-          completed++;
-          if (!gErr && fPath && fs.existsSync(fPath)) {
-            const fSize = fs.statSync(fPath).size;
-            generatedParts.push({
-              index: i + 1,
-              title: `Part ${i + 1}`,
-              startTime: start,
-              endTime: end,
-              duration: partDuration,
-              downloadUrl: `/api/get-part-video?session=${sessionId}&part=${i + 1}&download=1`,
-              streamUrl: `/api/get-part-video?session=${sessionId}&part=${i + 1}`,
-              size: fSize,
-            });
-          }
-
-          if (completed === partCount) {
-            generatedParts.sort((a, b) => a.index - b.index);
-            return res.json({
-              sessionId,
-              totalDuration: totalSec,
-              parts: generatedParts,
-            });
-          }
-        });
-      }
-      return;
+      console.warn('Source fetch failed:', err);
+      return res.status(500).json({ error: 'Could not download video stream from link' });
     }
 
     // Step 2: Probe total duration of downloaded video
     exec(
       `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${sourcePath}"`,
-      (probeErr, stdout) => {
+      async (probeErr, stdout) => {
         let totalDuration = 300;
         if (!probeErr && stdout) {
           const parsed = parseFloat(stdout.trim());
@@ -350,7 +300,7 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
         }
 
         const partCount = Math.max(1, Math.ceil(totalDuration / sliceSeconds));
-        const partsToSlice = Math.min(partCount, 25); // Cap to 25 parts to preserve performance
+        const partsToSlice = Math.min(partCount, 20); // Cap to 20 parts
         const partResults: {
           index: number;
           title: string;
@@ -359,75 +309,95 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
           duration: number;
           downloadUrl: string;
           streamUrl: string;
+          thumbnailUrl: string;
           size: number;
         }[] = [];
 
-        let slicedCount = 0;
-
+        // Sequential slice generation (prevents CPU lockup and ensures perfect H.264 yuv420p compatibility)
         for (let i = 0; i < partsToSlice; i++) {
           const start = i * sliceSeconds;
           const end = Math.min(totalDuration, (i + 1) * sliceSeconds);
           const partDur = end - start;
           const partFile = path.join(sessionDir, `part_${i + 1}.mp4`);
+          const thumbFile = path.join(sessionDir, `part_${i + 1}_thumb.jpg`);
 
           const startStr = formatTime(start);
-          const endStr = formatTime(end);
 
-          // Fast slice with ffmpeg
+          // Build standards-compliant H.264 slice following autoclip specifications:
+          // yuv420p + faststart + make_zero resets edit list so video plays cleanly from 00:00 on all mobile/desktop browsers
           const sliceCmd = isVertical
-            ? `ffmpeg -ss ${startStr} -to ${endStr} -i "${sourcePath}" -vf "crop=ih*9/16:ih" -c:v libx264 -preset ultrafast -c:a aac -movflags +faststart -y "${partFile}"`
-            : `ffmpeg -ss ${startStr} -to ${endStr} -i "${sourcePath}" -c copy -movflags +faststart -y "${partFile}"`;
+            ? `ffmpeg -ss ${startStr} -i "${sourcePath}" -t ${partDur} -map 0:v:0 -map 0:a:0? -vf "crop=ih*9/16:ih" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero -y "${partFile}"`
+            : `ffmpeg -ss ${startStr} -i "${sourcePath}" -t ${partDur} -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero -y "${partFile}"`;
 
-          exec(sliceCmd, (sErr) => {
-            slicedCount++;
-            if (!sErr && fs.existsSync(partFile) && fs.statSync(partFile).size > 1000) {
-              partResults.push({
-                index: i + 1,
-                title: `Part ${i + 1}`,
-                startTime: start,
-                endTime: end,
-                duration: partDur,
-                downloadUrl: `/api/get-part-video?session=${sessionId}&part=${i + 1}&download=1`,
-                streamUrl: `/api/get-part-video?session=${sessionId}&part=${i + 1}`,
-                size: fs.statSync(partFile).size,
-              });
-            }
-
-            if (slicedCount === partsToSlice) {
-              // IMMEDIATELY DELETE RAW SOURCE VIDEO to save server disk storage!
-              try {
-                if (sourcePath !== url && fs.existsSync(sourcePath)) {
-                  fs.unlinkSync(sourcePath);
-                }
-              } catch {}
-
-              partResults.sort((a, b) => a.index - b.index);
-
-              return res.json({
-                sessionId,
-                totalDuration,
-                parts: partResults,
-              });
-            }
+          await new Promise<void>((resolve) => {
+            exec(sliceCmd, () => {
+              // Extract real frame thumbnail from the generated part
+              if (fs.existsSync(partFile) && fs.statSync(partFile).size > 1000) {
+                exec(`ffmpeg -ss 00:00:01 -i "${partFile}" -vframes 1 -vf "scale=480:-1" -y "${thumbFile}"`, () => {
+                  resolve();
+                });
+              } else {
+                resolve();
+              }
+            });
           });
+
+          if (fs.existsSync(partFile) && fs.statSync(partFile).size > 1000) {
+            partResults.push({
+              index: i + 1,
+              title: `Part ${i + 1}`,
+              startTime: start,
+              endTime: end,
+              duration: partDur,
+              downloadUrl: `/api/get-part-video?session=${sessionId}&part=${i + 1}&download=1`,
+              streamUrl: `/api/get-part-video?session=${sessionId}&part=${i + 1}`,
+              thumbnailUrl: `/api/get-part-video?session=${sessionId}&part=${i + 1}&thumb=1`,
+              size: fs.statSync(partFile).size,
+            });
+          }
         }
+
+        // IMMEDIATELY DELETE RAW FULL SOURCE VIDEO to free server disk storage
+        try {
+          if (sourcePath !== url && fs.existsSync(sourcePath)) {
+            fs.unlinkSync(sourcePath);
+          }
+        } catch {}
+
+        if (partResults.length === 0) {
+          return res.status(500).json({ error: 'Failed to slice video clips' });
+        }
+
+        return res.json({
+          sessionId,
+          totalDuration,
+          parts: partResults,
+        });
       }
     );
   });
 });
 
 // -------------------------------------------------------------
-// ENDPOINT: SERVE THE REAL TRIMMED PART VIDEO
-// Supports byte ranges for instant HTML5 <video> seeking and
-// Content-Disposition for direct file downloading!
+// ENDPOINT: SERVE THE REAL TRIMMED PART VIDEO & THUMBNAIL
 // -------------------------------------------------------------
 app.get('/api/get-part-video', (req: Request, res: Response) => {
   const sessionId = req.query.session as string;
   const partIndex = parseInt(req.query.part as string, 10);
   const isDownload = req.query.download === '1' || req.query.download === 'true';
+  const isThumb = req.query.thumb === '1' || req.query.thumb === 'true';
 
   if (!sessionId || isNaN(partIndex)) {
     return res.status(400).json({ error: 'Valid session and part number required' });
+  }
+
+  // Handle direct frame thumbnail request
+  if (isThumb) {
+    const thumbFilePath = path.join(CACHE_DIR, sessionId, `part_${partIndex}_thumb.jpg`);
+    if (fs.existsSync(thumbFilePath)) {
+      res.setHeader('Content-Type', 'image/jpeg');
+      return res.sendFile(thumbFilePath);
+    }
   }
 
   const partFilePath = path.join(CACHE_DIR, sessionId, `part_${partIndex}.mp4`);

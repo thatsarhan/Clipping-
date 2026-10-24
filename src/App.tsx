@@ -15,7 +15,7 @@ import {
 } from './types/trimmer';
 import { SAMPLE_VIDEOS } from './data/sampleVideos';
 import { generateEqualSegments } from './utils/trimmerLogic';
-import { Loader2, Scissors, CheckCircle2, HardDrive } from 'lucide-react';
+import { Loader2, Scissors, CheckCircle2, HardDrive, AlertTriangle, ExternalLink, RefreshCw } from 'lucide-react';
 
 export default function App() {
   // Screen Management: 'setup' (Screen 1) or 'workspace' (Screen 2)
@@ -29,6 +29,7 @@ export default function App() {
   const [isLoadingVideo, setIsLoadingVideo] = useState(false);
   const [loadingPhase, setLoadingPhase] = useState<string>('Preparing video stream...');
   const [loadingPercent, setLoadingPercent] = useState<number>(10);
+  const [backendErrorModal, setBackendErrorModal] = useState<string | null>(null);
 
   // Screen 1 -> Screen 2: Proceed with actual downloading & trimming
   const handleProceedFromSetup = async (config: {
@@ -39,7 +40,7 @@ export default function App() {
   }) => {
     setIsLoadingVideo(true);
     setLoadingPercent(15);
-    setLoadingPhase('Downloading video from YouTube / source...');
+    setLoadingPhase('Downloading video stream with node yt-dlp...');
 
     setSelectedPlatform(config.platform);
     setSelectedQuality(config.quality);
@@ -85,8 +86,8 @@ export default function App() {
       } catch {}
     }
 
-    setLoadingPhase(`Trimming video into ${config.sliceSeconds}s parts with FFmpeg...`);
-    setLoadingPercent(55);
+    setLoadingPhase(`Slicing video into ${config.sliceSeconds}s real MP4 parts with FFmpeg...`);
+    setLoadingPercent(60);
 
     let serverParts: ClipSegment[] = [];
     let sessionId: string | undefined = undefined;
@@ -107,8 +108,8 @@ export default function App() {
       });
 
       if (splitRes.ok) {
-        setLoadingPhase('Optimizing clips and freeing server storage...');
-        setLoadingPercent(85);
+        setLoadingPhase('Finalizing parts and releasing server storage...');
+        setLoadingPercent(90);
         const splitData = await splitRes.json();
         sessionId = splitData.sessionId;
 
@@ -121,6 +122,7 @@ export default function App() {
             duration: number;
             streamUrl: string;
             downloadUrl: string;
+            thumbnailUrl?: string;
             size: number;
           }) => ({
             id: `clip_${p.index}`,
@@ -129,48 +131,78 @@ export default function App() {
             endTime: p.endTime,
             duration: p.duration,
             serverClipUrl: p.streamUrl,
+            thumbnailUrl: p.thumbnailUrl,
             fileSize: p.size,
           }));
         }
+      } else {
+        const errJson = await splitRes.json().catch(() => ({}));
+        console.warn('Backend process-and-split returned error:', errJson);
       }
     } catch (e) {
-      console.warn('Backend process-and-split encountered error, falling back to client mode...', e);
+      console.warn('Backend process-and-split connection error:', e);
     }
 
-    // Fallback clips if server was unreachable or in static client mode
-    if (serverParts.length === 0) {
-      serverParts = generateEqualSegments(duration, config.sliceSeconds, {
+    // If server trimming succeeded, go to workspace
+    if (serverParts.length > 0) {
+      setLoadingPhase('Done! Opening trimmed workspace...');
+      setLoadingPercent(100);
+
+      const newMeta: VideoMetadata = {
+        id: `vid_${Date.now()}`,
+        type: config.videoSource.type,
+        title,
+        url,
+        duration,
+        thumbnailUrl: config.videoSource.meta?.thumbnailUrl,
+        aspectRatio: config.platform === 'shorts' || config.platform === 'tiktok' ? '9:16' : '16:9',
+        resolution: config.quality === '4k' ? '4K Ultra HD (2160p)' : '1080p Full HD',
+        is4K: config.quality === '4k',
+        sessionId,
+      };
+
+      setTimeout(() => {
+        setVideoMeta(newMeta);
+        setClips(serverParts);
+        setIsLoadingVideo(false);
+        window.scrollTo({ top: 0, behavior: 'instant' });
+        setCurrentScreen('workspace');
+      }, 400);
+      return;
+    }
+
+    // If user provided a sample video or local file, we can fall back to browser playback
+    if (config.videoSource.type === 'sample' || config.videoSource.type === 'file') {
+      const fallbackClips = generateEqualSegments(duration, config.sliceSeconds, {
         titlePrefix: 'Part',
       });
-    }
-
-    setLoadingPhase('Done! Opening trimmed workspace...');
-    setLoadingPercent(100);
-
-    const newMeta: VideoMetadata = {
-      id: `vid_${Date.now()}`,
-      type: config.videoSource.type,
-      title,
-      url,
-      duration,
-      thumbnailUrl: config.videoSource.meta?.thumbnailUrl,
-      aspectRatio: config.platform === 'shorts' || config.platform === 'tiktok' ? '9:16' : '16:9',
-      resolution: config.quality === '4k' ? '4K Ultra HD (2160p)' : '1080p Full HD',
-      is4K: config.quality === '4k',
-      sessionId,
-    };
-
-    setTimeout(() => {
+      const newMeta: VideoMetadata = {
+        id: `vid_${Date.now()}`,
+        type: config.videoSource.type,
+        title,
+        url,
+        duration,
+        thumbnailUrl: config.videoSource.meta?.thumbnailUrl,
+        aspectRatio: config.platform === 'shorts' || config.platform === 'tiktok' ? '9:16' : '16:9',
+        resolution: config.quality === '4k' ? '4K Ultra HD (2160p)' : '1080p Full HD',
+        is4K: config.quality === '4k',
+      };
       setVideoMeta(newMeta);
-      setClips(serverParts);
+      setClips(fallbackClips);
       setIsLoadingVideo(false);
       window.scrollTo({ top: 0, behavior: 'instant' });
       setCurrentScreen('workspace');
-    }, 400);
+      return;
+    }
+
+    // If YouTube video failed to download (e.g. running on static Vercel host without FFmpeg)
+    setIsLoadingVideo(false);
+    setBackendErrorModal(
+      'YouTube video downloading requires our Full-Stack Cloud Run server with FFmpeg. If you are viewing on a static host (like Vercel), please open the Cloud Run app link below or upload a video file directly.'
+    );
   };
 
   const handleBackToSetup = () => {
-    // If there was an active session on the server, clean it up immediately
     if (videoMeta.sessionId) {
       try {
         fetch('/api/cleanup-session', {
@@ -250,6 +282,46 @@ export default function App() {
               <span>
                 <strong>Smart Storage:</strong> Full source video is removed immediately after trimming to keep server lightweight.
               </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Backend / Static Error Dialog */}
+      {backendErrorModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-7 max-w-md w-full shadow-2xl text-center space-y-5">
+            <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
+              <AlertTriangle className="w-7 h-7" />
+            </div>
+
+            <div className="space-y-2">
+              <h3 className="text-base sm:text-lg font-bold text-white">
+                Full-Stack Server Required
+              </h3>
+              <p className="text-xs text-slate-400 text-left leading-relaxed">
+                {backendErrorModal}
+              </p>
+            </div>
+
+            <div className="space-y-2 pt-2">
+              <a
+                href="https://ais-dev-yfp5pqlc7d3p26iilsu5e6-555336126681.asia-east1.run.app"
+                target="_blank"
+                rel="noreferrer"
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-red-600/20"
+              >
+                <span>Open Full-Stack Cloud Run App</span>
+                <ExternalLink className="w-3.5 h-3.5" />
+              </a>
+
+              <button
+                type="button"
+                onClick={() => setBackendErrorModal(null)}
+                className="w-full px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold transition-colors cursor-pointer"
+              >
+                Dismiss & Try Uploading File
+              </button>
             </div>
           </div>
         </div>

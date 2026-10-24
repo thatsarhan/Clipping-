@@ -10,10 +10,11 @@ import {
   Pause,
   Loader2,
   AlertCircle,
+  ExternalLink,
 } from 'lucide-react';
 import { ClipSegment, VideoMetadata, PlatformFormat, VideoQuality } from '../types/trimmer';
 import { formatTimestamp } from '../utils/trimmerLogic';
-import { triggerDownload, renderSyntheticClipInBrowser } from '../utils/videoExporter';
+import { triggerDownload } from '../utils/videoExporter';
 
 interface NativeVideoClipCardProps {
   clip: ClipSegment;
@@ -34,56 +35,75 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
   const [copiedLink, setCopiedLink] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadSuccess, setDownloadSuccess] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isVideoLoading, setIsVideoLoading] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
+  const [posterLoaded, setPosterLoaded] = useState(false);
   const [activeVideoSrc, setActiveVideoSrc] = useState<string>('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const isVertical = platform === 'shorts' || platform === 'tiktok' || platform === 'instagram';
 
-  // Compute the trimmed video source:
-  // Prefer in-memory blob URL or direct server trimmed part endpoint
+  const targetThumb = clip.thumbnailUrl || videoMeta.thumbnailUrl;
+
+  // Safely check if thumbnail URL is valid to prevent broken image icon
+  useEffect(() => {
+    if (targetThumb) {
+      const img = new Image();
+      img.onload = () => setPosterLoaded(true);
+      img.onerror = () => setPosterLoaded(false);
+      img.src = targetThumb;
+    } else {
+      setPosterLoaded(false);
+    }
+  }, [targetThumb]);
+
+  // Set active video source
   useEffect(() => {
     if (clip.videoBlobUrl) {
       setActiveVideoSrc(clip.videoBlobUrl);
     } else if (clip.serverClipUrl) {
       setActiveVideoSrc(clip.serverClipUrl);
     } else if (videoMeta.type === 'sample' && videoMeta.url) {
-      setActiveVideoSrc(videoMeta.url);
+      setActiveVideoSrc(`${videoMeta.url}#t=${clip.startTime},${clip.endTime}`);
     }
-  }, [clip.videoBlobUrl, clip.serverClipUrl, videoMeta.type, videoMeta.url]);
+  }, [clip.videoBlobUrl, clip.serverClipUrl, videoMeta.type, videoMeta.url, clip.startTime, clip.endTime]);
 
-  // Direct download link
+  // Direct download link on full-stack server
   const directDownloadUrl = clip.serverClipUrl
     ? `${clip.serverClipUrl}${clip.serverClipUrl.includes('?') ? '&' : '?'}download=1`
     : '';
 
-  // Download handler: downloads the trimmed MP4 directly without external redirection
+  // Download handler: Downloads the genuine MP4 file directly
   const handleDownloadPart = async () => {
     if (isDownloading) return;
     setIsDownloading(true);
     setDownloadSuccess(false);
+    setDownloadError(null);
 
     const safeFilename = `Part_${index + 1}_${quality}.mp4`;
 
     try {
-      // 1. If we have a ready blob URL, fetch and save
+      // 1. If we have a local blob URL in memory, trigger instant download
       if (clip.videoBlobUrl) {
         const bRes = await fetch(clip.videoBlobUrl);
         const bBlob = await bRes.blob();
-        triggerDownload(bBlob, safeFilename);
-        setDownloadSuccess(true);
-        setTimeout(() => setDownloadSuccess(false), 3000);
-        return;
+        if (bBlob.size > 5000) {
+          triggerDownload(bBlob, safeFilename);
+          setDownloadSuccess(true);
+          setTimeout(() => setDownloadSuccess(false), 3000);
+          return;
+        }
       }
 
-      // 2. If we have server trimmed clip endpoint
+      // 2. If we have server trimmed clip endpoint, fetch and save real MP4
       if (clip.serverClipUrl) {
-        const res = await fetch(directDownloadUrl || clip.serverClipUrl);
+        const fetchUrl = directDownloadUrl || clip.serverClipUrl;
+        const res = await fetch(fetchUrl);
         if (res.ok) {
           const blob = await res.blob();
+          // Ensure it's a real video (>10KB) and not a JSON error message
           if (blob.size > 10000 && !blob.type.includes('json')) {
             triggerDownload(blob, safeFilename);
             setDownloadSuccess(true);
@@ -93,30 +113,26 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
         }
       }
 
-      // 3. Client-side canvas/MediaRecorder rendering fallback
-      const renderedBlob = await renderSyntheticClipInBrowser(
-        clip.title,
-        clip.duration,
-        isVertical,
-        videoMeta.thumbnailUrl
-      );
-      triggerDownload(renderedBlob, safeFilename);
-      setDownloadSuccess(true);
-      setTimeout(() => setDownloadSuccess(false), 3000);
-    } catch (err) {
+      // 3. If direct link or sample video
+      if (videoMeta.type === 'sample' && videoMeta.url) {
+        const res = await fetch(videoMeta.url);
+        if (res.ok) {
+          const blob = await res.blob();
+          if (blob.size > 10000) {
+            triggerDownload(blob, safeFilename);
+            setDownloadSuccess(true);
+            setTimeout(() => setDownloadSuccess(false), 3000);
+            return;
+          }
+        }
+      }
+
+      // If backend is not responding or on static host without server
+      throw new Error('Video segment stream unavailable on this server.');
+    } catch (err: unknown) {
       console.error('Download part error:', err);
-      // Generate emergency client-side video file so user ALWAYS receives a real playable video
-      try {
-        const fallbackBlob = await renderSyntheticClipInBrowser(
-          `Part ${index + 1}`,
-          clip.duration,
-          isVertical,
-          videoMeta.thumbnailUrl
-        );
-        triggerDownload(fallbackBlob, safeFilename);
-        setDownloadSuccess(true);
-        setTimeout(() => setDownloadSuccess(false), 3000);
-      } catch {}
+      setDownloadError(err instanceof Error ? err.message : 'Download failed');
+      setTimeout(() => setDownloadError(null), 4000);
     } finally {
       setIsDownloading(false);
     }
@@ -154,8 +170,6 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
     }
   };
 
-  const posterImage = videoMeta.thumbnailUrl;
-
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 shadow-xl flex flex-col justify-between transition-all hover:border-slate-700">
       {/* Top Header: Part Headline & Timestamps */}
@@ -173,14 +187,14 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
             {formatTimestamp(clip.startTime)} - {formatTimestamp(clip.endTime)}
             <span className="text-slate-600 mx-1.5">·</span>
             <span className="text-emerald-400 font-semibold">{clip.duration}s Clip</span>
-            {clip.fileSize && (
+            {clip.fileSize ? (
               <>
                 <span className="text-slate-600 mx-1.5">·</span>
                 <span className="text-slate-300 font-medium">
                   {(clip.fileSize / (1024 * 1024)).toFixed(1)} MB
                 </span>
               </>
-            )}
+            ) : null}
           </p>
         </div>
 
@@ -224,39 +238,45 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
         </div>
       </div>
 
-      {/* Playable Trimmed Video Player (No YouTube iframes, no YouTube links) */}
+      {/* Playable Trimmed Video Player */}
       <div className="flex-1 flex items-center justify-center my-2">
         <div
-          className={`w-full bg-black rounded-xl overflow-hidden border border-slate-800/80 flex items-center justify-center relative group ${
+          className={`w-full bg-slate-950 rounded-xl overflow-hidden border border-slate-800/80 flex items-center justify-center relative group ${
             isVertical ? 'aspect-[9/16] max-w-[260px] mx-auto' : 'aspect-video'
           }`}
         >
-          <video
-            ref={videoRef}
-            controls
-            playsInline
-            preload="metadata"
-            poster={posterImage}
-            src={activeVideoSrc}
-            onPlay={() => setIsPlaying(true)}
-            onPause={() => setIsPlaying(false)}
-            onTimeUpdate={() => {
-              if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
-            }}
-            onWaiting={() => setIsVideoLoading(true)}
-            onPlaying={() => setIsVideoLoading(false)}
-            className="w-full h-full object-contain"
-          >
-            Your browser does not support the video tag.
-          </video>
+          {activeVideoSrc ? (
+            <video
+              ref={videoRef}
+              controls
+              playsInline
+              preload="metadata"
+              poster={posterLoaded ? targetThumb : undefined}
+              src={activeVideoSrc}
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              onWaiting={() => setIsVideoLoading(true)}
+              onPlaying={() => setIsVideoLoading(false)}
+              className="w-full h-full object-cover"
+            >
+              Your browser does not support the video tag.
+            </video>
+          ) : (
+            /* Elegant Fallback Surface (Never broken image icon) */
+            <div className="w-full h-full flex flex-col items-center justify-center p-4 text-center bg-gradient-to-br from-slate-950 to-slate-900 text-slate-400">
+              <Film className="w-8 h-8 text-slate-600 mb-2" />
+              <span className="text-xs font-semibold text-slate-300">Part {index + 1} Clip</span>
+              <span className="text-[11px] text-slate-500 font-mono mt-0.5">{clip.duration}s ready</span>
+            </div>
+          )}
 
           {/* Central Play/Pause Overlay */}
-          {!isPlaying && (
+          {activeVideoSrc && !isPlaying && (
             <button
               type="button"
               onClick={togglePlay}
               aria-label={`Play trimmed Part ${index + 1}`}
-              className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-black/70 hover:bg-red-600/90 text-white flex items-center justify-center backdrop-blur-xs transition-all shadow-lg hover:scale-110 cursor-pointer pointer-events-auto"
+              className="absolute inset-0 m-auto w-12 h-12 rounded-full bg-black/75 hover:bg-red-600 text-white flex items-center justify-center backdrop-blur-xs transition-all shadow-lg hover:scale-110 cursor-pointer pointer-events-auto"
             >
               {isVideoLoading ? (
                 <Loader2 className="w-6 h-6 animate-spin text-white" />
@@ -266,12 +286,20 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
             </button>
           )}
 
-          {/* Trimmed Duration Pill at bottom-left */}
-          <div className="absolute bottom-2 left-2 pointer-events-none px-2 py-0.5 rounded bg-black/80 text-[10px] font-mono text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
+          {/* Duration Pill at bottom-left */}
+          <div className="absolute bottom-2 left-2 pointer-events-none px-2 py-0.5 rounded bg-black/80 text-[10px] font-mono text-emerald-400 border border-emerald-500/30 flex items-center gap-1 z-10">
             <span>0:00 / {formatTimestamp(clip.duration)}</span>
           </div>
         </div>
       </div>
+
+      {/* Error alert toast if download issue */}
+      {downloadError && (
+        <div className="my-2 p-2 rounded-lg bg-red-950/80 border border-red-800 text-[11px] text-red-300 flex items-center gap-1.5">
+          <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+          <span>{downloadError}</span>
+        </div>
+      )}
 
       {/* Bottom Bar: Format Tag and Direct Download Button */}
       <div className="mt-4 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
@@ -292,7 +320,7 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
           {isDownloading ? (
             <>
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              <span>Packaging Part {index + 1}...</span>
+              <span>Fetching Part {index + 1}...</span>
             </>
           ) : downloadSuccess ? (
             <>
