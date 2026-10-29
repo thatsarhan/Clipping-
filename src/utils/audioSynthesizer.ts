@@ -85,40 +85,4 @@ export function audioBufferToWav(buffer: AudioBuffer): Blob {
   return new Blob([view], { type: 'audio/wav' });
 }
 
-// Generate a synthetic audio clip track with optional censor bleeps
-export async function createSyntheticAudioTrack(
-  durationSeconds: number,
-  censorRanges: { start: number; end: number }[] = []
-): Promise<Blob> {
-  const sampleRate = 44100;
-  const length = Math.floor(durationSeconds * sampleRate);
-  const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-  const ctx = new AudioContextClass();
-  const buffer = ctx.createBuffer(2, Math.max(length, 1), sampleRate);
 
-  const left = buffer.getChannelData(0);
-  const right = buffer.getChannelData(1);
-
-  // Fill with low atmospheric room tone
-  for (let i = 0; i < length; i++) {
-    const t = i / sampleRate;
-    // Ambient subtle presence
-    const ambient = (Math.random() * 2 - 1) * 0.005;
-    left[i] = ambient;
-    right[i] = ambient;
-  }
-
-  // Insert 1000Hz bleeps in censor intervals
-  for (const range of censorRanges) {
-    const startIdx = Math.floor(range.start * sampleRate);
-    const endIdx = Math.min(length, Math.floor(range.end * sampleRate));
-    for (let i = startIdx; i < endIdx; i++) {
-      const t = i / sampleRate;
-      const bleep = Math.sin(2 * Math.PI * 1000 * t) * 0.35;
-      left[i] = bleep;
-      right[i] = bleep;
-    }
-  }
-
-  return audioBufferToWav(buffer);
-}

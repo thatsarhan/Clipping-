@@ -17,7 +17,7 @@ import {
 import { ClipSegment, VideoMetadata, PlatformFormat } from '../types/trimmer';
 import { formatTimestamp, estimateFileSizeMb, generateYtDlpCommand } from '../utils/trimmerLogic';
 import { triggerDownload, triggerTextDownload } from '../utils/videoExporter';
-import { createSyntheticAudioTrack, playCensorBeep } from '../utils/audioSynthesizer';
+import { playCensorBeep } from '../utils/audioSynthesizer';
 import { PLATFORM_CONFIGS } from '../data/platforms';
 
 interface ClipCardProps {
@@ -75,12 +75,16 @@ export const ClipCard: React.FC<ClipCardProps> = ({
   const handleDownloadAudioOnly = async () => {
     setIsExportingAudio(true);
     try {
-      const audioBlob = await createSyntheticAudioTrack(
-        clip.duration,
-        clip.censorRanges || []
-      );
-      const safeTitle = `audio_clip_${index + 1}_${clip.title.replace(/[^a-zA-Z0-9_-]/g, '_')}.wav`;
-      triggerDownload(audioBlob, safeTitle);
+      if (clip.serverClipUrl) {
+        const res = await fetch(clip.serverClipUrl);
+        if (res.ok) {
+          const blob = await res.blob();
+          const safeTitle = `audio_clip_${index + 1}_${clip.title.replace(/[^a-zA-Z0-9_-]/g, '_')}.mp4`;
+          triggerDownload(blob, safeTitle);
+          return;
+        }
+      }
+      throw new Error('Real video audio track is available when video parts are processed on server.');
     } catch (err) {
       console.error('Audio export error:', err);
     } finally {

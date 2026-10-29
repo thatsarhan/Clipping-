@@ -161,49 +161,6 @@ app.get('/api/video-info', async (req: Request, res: Response) => {
   );
 });
 
-// Synthesize a high-quality MP4 clip when raw stream cannot be directly extracted
-function generateSyntheticClip(
-  thumbnailUrl: string | null,
-  durationSec: number,
-  isVertical: boolean,
-  outputPath: string,
-  callback: (err: Error | null, filePath: string | null) => void
-) {
-  const duration = Math.max(3, Math.min(300, Math.round(durationSec)));
-  const width = isVertical ? 1080 : 1920;
-  const height = isVertical ? 1920 : 1080;
-
-  const tempThumb = path.join(CACHE_DIR, `thumb_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
-
-  const buildVideo = (thumbPath: string | null) => {
-    let cmd = '';
-    if (thumbPath && fs.existsSync(thumbPath)) {
-      cmd = `ffmpeg -loop 1 -i "${thumbPath}" -f lavfi -i "anullsrc=r=44100:cl=stereo" -t ${duration} -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},format=yuv420p" -c:v libx264 -preset ultrafast -c:a aac -movflags +faststart -y "${outputPath}"`;
-    } else {
-      cmd = `ffmpeg -f lavfi -i "color=c=0x0f172a:s=${width}x${height}:d=${duration}" -f lavfi -i "anullsrc=r=44100:cl=stereo" -t ${duration} -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -movflags +faststart -y "${outputPath}"`;
-    }
-
-    exec(cmd, (err) => {
-      try { if (thumbPath) fs.unlinkSync(thumbPath); } catch {}
-      if (err || !fs.existsSync(outputPath) || fs.statSync(outputPath).size < 10000) {
-        return callback(err || new Error('Video generation failed'), null);
-      }
-      callback(null, outputPath);
-    });
-  };
-
-  if (thumbnailUrl && thumbnailUrl.startsWith('http')) {
-    fetch(thumbnailUrl)
-      .then((r) => r.arrayBuffer())
-      .then((buf) => {
-        fs.writeFileSync(tempThumb, Buffer.from(buf));
-        buildVideo(tempThumb);
-      })
-      .catch(() => buildVideo(null));
-  } else {
-    buildVideo(null);
-  }
-}
 
 // -------------------------------------------------------------
 // MAIN WORKFLOW: PROCESS & SPLIT VIDEO INTO TRIMMED PARTS
@@ -262,8 +219,8 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
     }
 
     // YouTube URL -> High-compatibility download using autoclip player_client args
-    const ytCmd = `yt-dlp --js-runtimes node --extractor-args "youtube:player_client=android,web,tv" -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best" --merge-output-format mp4 --no-playlist --no-warnings "${url}" -o "${rawTempVideo}"`;
-    exec(ytCmd, { maxBuffer: 50 * 1024 * 1024, timeout: 60000 }, (err) => {
+    const ytCmd = `yt-dlp --js-runtimes node:/usr/local/bin/node --extractor-args "youtube:player_client=android,web,tv" -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best" --merge-output-format mp4 --no-playlist --no-warnings "${url}" -o "${rawTempVideo}"`;
+    exec(ytCmd, { maxBuffer: 50 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
       let candidate: string | null = null;
       if (fs.existsSync(rawTempVideo) && fs.statSync(rawTempVideo).size > 10000) {
         candidate = rawTempVideo;
@@ -278,15 +235,20 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
       if (candidate) {
         onDownloaded(null, candidate);
       } else {
-        onDownloaded(err || new Error('YouTube download failed'), null);
+        const fullErr = (err?.message || '') + ' ' + (stderr || '');
+        let friendlyErr = 'Could not download video stream from link.';
+        if (fullErr.includes('Sign in to confirm you’re not a bot') || fullErr.includes('bot')) {
+          friendlyErr = 'YouTube blocked automated cloud downloading on this server IP ("Sign in to confirm you are not a bot"). Please upload your video file directly using the "Upload Video" tab for instant 100% genuine FFmpeg trimming.';
+        }
+        onDownloaded(new Error(friendlyErr), null);
       }
     });
   };
 
   fetchSource(async (err, sourcePath) => {
     if (err || !sourcePath || !fs.existsSync(sourcePath)) {
-      console.warn('Source fetch failed:', err);
-      return res.status(500).json({ error: 'Could not download video stream from link' });
+      console.warn('Source fetch failed:', err?.message || err);
+      return res.status(400).json({ error: err?.message || 'Could not download video stream from link' });
     }
 
     // Step 2: Probe total duration of downloaded video
@@ -326,8 +288,8 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
           // Build standards-compliant H.264 slice following autoclip specifications:
           // yuv420p + faststart + make_zero resets edit list so video plays cleanly from 00:00 on all mobile/desktop browsers
           const sliceCmd = isVertical
-            ? `ffmpeg -ss ${startStr} -i "${sourcePath}" -t ${partDur} -map 0:v:0 -map 0:a:0? -vf "crop=ih*9/16:ih" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero -y "${partFile}"`
-            : `ffmpeg -ss ${startStr} -i "${sourcePath}" -t ${partDur} -map 0:v:0 -map 0:a:0? -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero -y "${partFile}"`;
+            ? `ffmpeg -ss ${startStr} -i "${sourcePath}" -t ${partDur} -map 0:v:0 -map 0:a:0? -vf "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,format=yuv420p" -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero -y "${partFile}"`
+            : `ffmpeg -ss ${startStr} -i "${sourcePath}" -t ${partDur} -map 0:v:0 -map 0:a:0? -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero -y "${partFile}"`;
 
           await new Promise<void>((resolve) => {
             exec(sliceCmd, () => {
@@ -359,7 +321,7 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
 
         // IMMEDIATELY DELETE RAW FULL SOURCE VIDEO to free server disk storage
         try {
-          if (sourcePath !== url && fs.existsSync(sourcePath)) {
+          if (fs.existsSync(sourcePath) && (sourcePath.includes(CACHE_DIR) || sourcePath.includes('source_raw') || sourcePath.includes('user_'))) {
             fs.unlinkSync(sourcePath);
           }
         } catch {}

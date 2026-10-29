@@ -29,14 +29,23 @@ interface SetupWizardViewProps {
     sliceSeconds: number;
   }) => void;
   isLoading: boolean;
+  activeSourceTab?: 'youtube' | 'sample' | 'upload';
+  onTabChange?: (tab: 'youtube' | 'sample' | 'upload') => void;
 }
 
 export const SetupWizardView: React.FC<SetupWizardViewProps> = ({
   onProceed,
   isLoading,
+  activeSourceTab,
+  onTabChange,
 }) => {
   // Step 1: Input source
-  const [sourceType, setSourceType] = useState<'youtube' | 'sample' | 'upload'>('youtube');
+  const [internalSourceType, setInternalSourceType] = useState<'youtube' | 'sample' | 'upload'>('youtube');
+  const sourceType = activeSourceTab || internalSourceType;
+  const setSourceType = (tab: 'youtube' | 'sample' | 'upload') => {
+    setInternalSourceType(tab);
+    onTabChange?.(tab);
+  };
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [selectedSampleId, setSelectedSampleId] = useState(SAMPLE_VIDEOS[0].id);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -281,23 +290,63 @@ export const SetupWizardView: React.FC<SetupWizardViewProps> = ({
 
           {/* Mode 3: Local File Upload */}
           {sourceType === 'upload' && (
-            <label className="flex flex-col items-center justify-center border-2 border-dashed border-slate-800 hover:border-slate-700 bg-slate-950/60 rounded-2xl p-6 cursor-pointer transition-colors">
-              <Upload className="w-8 h-8 text-red-400 mb-2" />
-              <span className="text-sm font-medium text-slate-200">
-                {uploadedFile ? uploadedFile.name : 'Choose a video from your computer'}
-              </span>
-              <span className="text-xs text-slate-500 mt-1">MP4, WebM, MOV, MKV (Supports 4K UHD)</span>
-              <input
-                type="file"
-                accept="video/*"
-                onChange={(e) => {
-                  if (e.target.files?.[0]) {
-                    setUploadedFile(e.target.files[0]);
+            <div className="space-y-3">
+              <label
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (e.dataTransfer.files?.[0]) {
+                    setUploadedFile(e.dataTransfer.files[0]);
+                    setErrorMsg(null);
                   }
                 }}
-                className="hidden"
-              />
-            </label>
+                className={`flex flex-col items-center justify-center border-2 border-dashed rounded-2xl p-7 cursor-pointer transition-all ${
+                  uploadedFile
+                    ? 'border-emerald-500/80 bg-emerald-950/20 shadow-lg'
+                    : 'border-slate-800 hover:border-red-500/60 bg-slate-950/80'
+                }`}
+              >
+                <div className={`w-12 h-12 rounded-xl flex items-center justify-center mb-3 ${
+                  uploadedFile ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/10 text-red-400'
+                }`}>
+                  <Upload className="w-6 h-6" />
+                </div>
+                <span className="text-sm font-semibold text-slate-100 text-center">
+                  {uploadedFile ? uploadedFile.name : 'Choose or Drop a video from your device'}
+                </span>
+                {uploadedFile ? (
+                  <span className="text-xs text-emerald-400 font-mono mt-1 font-semibold">
+                    {(uploadedFile.size / (1024 * 1024)).toFixed(1)} MB ready for 100% genuine trimming
+                  </span>
+                ) : (
+                  <span className="text-xs text-slate-400 mt-1">
+                    MP4, WebM, MOV (High Quality 4K / 1080p supported)
+                  </span>
+                )}
+                <input
+                  type="file"
+                  accept="video/*"
+                  onChange={(e) => {
+                    if (e.target.files?.[0]) {
+                      setUploadedFile(e.target.files[0]);
+                      setErrorMsg(null);
+                    }
+                  }}
+                  className="hidden"
+                />
+              </label>
+
+              <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800/80 flex items-center gap-2 text-xs text-slate-400">
+                <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>
+                  <strong>100% Guaranteed:</strong> Local upload guarantees genuine video frames and audio without any YouTube IP restrictions.
+                </span>
+              </div>
+            </div>
           )}
 
           {errorMsg && (

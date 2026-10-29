@@ -113,22 +113,8 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
         }
       }
 
-      // 3. If direct link or sample video
-      if (videoMeta.type === 'sample' && videoMeta.url) {
-        const res = await fetch(videoMeta.url);
-        if (res.ok) {
-          const blob = await res.blob();
-          if (blob.size > 10000) {
-            triggerDownload(blob, safeFilename);
-            setDownloadSuccess(true);
-            setTimeout(() => setDownloadSuccess(false), 3000);
-            return;
-          }
-        }
-      }
-
-      // If backend is not responding or on static host without server
-      throw new Error('Video segment stream unavailable on this server.');
+      // If clip is not available
+      throw new Error(`Trimmed video file for Part ${index + 1} is not available on server.`);
     } catch (err: unknown) {
       console.error('Download part error:', err);
       setDownloadError(err instanceof Error ? err.message : 'Download failed');
