@@ -8,6 +8,7 @@ import {
   validateClip,
   generateYtDlpCommand,
   generateFfmpegCommand,
+  calculateClipCount,
   estimateFileSizeMb,
 } from './trimmerLogic';
 
@@ -106,9 +107,28 @@ test('generateYtDlpCommand and generateFfmpegCommand create expected command str
   assert.ok(ffmpeg.includes('part_1.mp4'));
 });
 
-test('estimateFileSizeMb computes reasonable byte size', () => {
-  const size = estimateFileSizeMb(120, 2500); // 2 min at 2.5 Mbps
-  assert.ok(size.includes('MB'));
-  const num = parseFloat(size);
-  assert.ok(num > 20 && num < 50);
+test('calculateClipCount matches user specification table and ceiling logic', () => {
+  assert.equal(calculateClipCount(600, 30), 20); // 10m / 30s = 20
+  assert.equal(calculateClipCount(600, 60), 10); // 10m / 60s = 10
+  assert.equal(calculateClipCount(600, 15), 40); // 10m / 15s = 40
+  assert.equal(calculateClipCount(600, 45), 14); // ceil(600 / 45) = ceil(13.33) = 14 clips
+  assert.equal(calculateClipCount(20, 30), 1);   // video shorter than clip duration
+});
+
+test('generateEqualSegments generates exact 13 full clips of 45s + 1 final clip from 09:45 to 10:00', () => {
+  const segments = generateEqualSegments(600, 45);
+  assert.equal(segments.length, 14); // ceil(600 / 45) = 14
+
+  // Check first 13 clips are 45 seconds each
+  for (let i = 0; i < 13; i++) {
+    assert.equal(segments[i].duration, 45);
+    assert.equal(segments[i].startTime, i * 45);
+    assert.equal(segments[i].endTime, (i + 1) * 45);
+  }
+
+  // Check 14th clip has exactly the remaining footage from 09:45 to 10:00
+  const lastClip = segments[13];
+  assert.equal(lastClip.startTime, 585); // 09:45
+  assert.equal(lastClip.endTime, 600); // 10:00
+  assert.equal(lastClip.duration, 15); // 600 - 585 = 15s remainder
 });

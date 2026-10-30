@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Header } from './components/Header';
 import { SetupWizardView } from './components/SetupWizardView';
 import { CleanWorkspaceView } from './components/CleanWorkspaceView';
@@ -12,52 +12,85 @@ import {
   VideoMetadata,
   PlatformFormat,
   VideoQuality,
+  OutputOrientation,
 } from './types/trimmer';
 import { SAMPLE_VIDEOS } from './data/sampleVideos';
-import { generateEqualSegments } from './utils/trimmerLogic';
-import { Loader2, Scissors, CheckCircle2, HardDrive, AlertTriangle, ExternalLink, RefreshCw } from 'lucide-react';
+import { extractYouTubeId } from './utils/trimmerLogic';
+import {
+  Loader2,
+  Scissors,
+  HardDrive,
+  AlertTriangle,
+  ExternalLink,
+  Download,
+  XCircle,
+} from 'lucide-react';
 
 export default function App() {
   // Screen Management: 'setup' (Screen 1) or 'workspace' (Screen 2)
   const [currentScreen, setCurrentScreen] = useState<'setup' | 'workspace'>('setup');
   const [activeSourceTab, setActiveSourceTab] = useState<'youtube' | 'sample' | 'upload'>('youtube');
+  const [lastAttemptedUrl, setLastAttemptedUrl] = useState<string>('');
 
   // Video Configuration State
   const [videoMeta, setVideoMeta] = useState<VideoMetadata>(SAMPLE_VIDEOS[0]);
   const [selectedPlatform, setSelectedPlatform] = useState<PlatformFormat>('shorts');
   const [selectedQuality, setSelectedQuality] = useState<VideoQuality>('4k');
+  const [selectedOrientation, setSelectedOrientation] = useState<OutputOrientation>('9:16');
   const [clips, setClips] = useState<ClipSegment[]>([]);
+
+  // Asynchronous Job State
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [isLoadingVideo, setIsLoadingVideo] = useState(false);
-  const [loadingPhase, setLoadingPhase] = useState<string>('Preparing video stream...');
-  const [loadingPercent, setLoadingPercent] = useState<number>(10);
+  const [loadingPhase, setLoadingPhase] = useState<string>('Submitting processing job...');
+  const [loadingPercent, setLoadingPercent] = useState<number>(5);
   const [backendErrorModal, setBackendErrorModal] = useState<string | null>(null);
 
-  // Screen 1 -> Screen 2: Proceed with actual downloading & trimming
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  const stopPolling = () => {
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      stopPolling();
+    };
+  }, []);
+
+  // Screen 1 -> Screen 2: Proceed with actual asynchronous job creation & trimming
   const handleProceedFromSetup = async (config: {
     videoSource: { type: 'youtube' | 'file' | 'sample'; urlOrFile: string | File; meta?: Partial<VideoMetadata> };
+    orientation: OutputOrientation;
     platform: PlatformFormat;
     quality: VideoQuality;
     sliceSeconds: number;
   }) => {
+    stopPolling();
     setIsLoadingVideo(true);
-    setLoadingPercent(15);
-    setLoadingPhase('Downloading video stream with node yt-dlp...');
+    setLoadingPercent(5);
+    setLoadingPhase('Validating video stream and preparing background job...');
 
     setSelectedPlatform(config.platform);
     setSelectedQuality(config.quality);
+    setSelectedOrientation(config.orientation);
 
     let duration = config.videoSource.meta?.duration || 600;
     let title = config.videoSource.meta?.title || 'Video';
     let url = typeof config.videoSource.urlOrFile === 'string' ? config.videoSource.urlOrFile : '';
-    let uploadedServerUrl = '';
+    let targetJobUrl = url;
+    setLastAttemptedUrl(url);
 
-    // If local file uploaded, upload to temporary processing stream
+    // If local file uploaded, stream to server first
     if (config.videoSource.type === 'file' && config.videoSource.urlOrFile instanceof File) {
       const file = config.videoSource.urlOrFile;
       url = URL.createObjectURL(file);
       title = file.name.replace(/\.[^/.]+$/, '');
-      setLoadingPhase('Uploading file for ultra-fast FFmpeg trimming...');
-      setLoadingPercent(30);
+      setLoadingPhase('Uploading file to server for genuine FFmpeg slicing...');
+      setLoadingPercent(15);
 
       try {
         const uploadRes = await fetch('/api/upload-video', {
@@ -70,122 +103,126 @@ export default function App() {
         });
         if (uploadRes.ok) {
           const upData = await uploadRes.json();
-          if (upData.url) uploadedServerUrl = upData.url;
+          if (upData.url) targetJobUrl = upData.url;
           if (upData.duration) duration = upData.duration;
+        } else {
+          throw new Error('Failed to upload video file to server.');
         }
-      } catch {}
-    } else if (config.videoSource.type === 'youtube' && url) {
-      setLoadingPhase('Analyzing YouTube media stream...');
-      setLoadingPercent(25);
-      try {
-        const infoRes = await fetch(`/api/video-info?url=${encodeURIComponent(url)}`);
-        if (infoRes.ok) {
-          const infoData = await infoRes.json();
-          if (infoData.duration) duration = infoData.duration;
-          if (infoData.title) title = infoData.title;
-        }
-      } catch {}
+      } catch (err: unknown) {
+        setIsLoadingVideo(false);
+        setBackendErrorModal(err instanceof Error ? err.message : 'Upload failed.');
+        return;
+      }
     }
 
-    setLoadingPhase(`Slicing video into ${config.sliceSeconds}s real MP4 parts with FFmpeg...`);
-    setLoadingPercent(60);
-
-    let serverParts: ClipSegment[] = [];
-    let sessionId: string | undefined = undefined;
-
-    // Call backend to download and slice video into real parts
+    // Call /api/jobs/create
     try {
-      const targetUrl = uploadedServerUrl || url;
-      const splitRes = await fetch('/api/process-and-split', {
+      setLoadingPhase('Creating video segmentation job...');
+      setLoadingPercent(20);
+
+      const createRes = await fetch('/api/jobs/create', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          url: targetUrl,
+          url: targetJobUrl,
           sliceSeconds: config.sliceSeconds,
-          platform: config.platform,
+          orientation: config.orientation,
           quality: config.quality,
           title,
         }),
       });
 
-      if (splitRes.ok) {
-        setLoadingPhase('Finalizing parts and releasing server storage...');
-        setLoadingPercent(90);
-        const splitData = await splitRes.json();
-        sessionId = splitData.sessionId;
-
-        if (Array.isArray(splitData.parts) && splitData.parts.length > 0) {
-          serverParts = splitData.parts.map((p: {
-            index: number;
-            title: string;
-            startTime: number;
-            endTime: number;
-            duration: number;
-            streamUrl: string;
-            downloadUrl: string;
-            thumbnailUrl?: string;
-            size: number;
-          }) => ({
-            id: `clip_${p.index}`,
-            title: p.title || `Part ${p.index}`,
-            startTime: p.startTime,
-            endTime: p.endTime,
-            duration: p.duration,
-            serverClipUrl: p.streamUrl,
-            thumbnailUrl: p.thumbnailUrl,
-            fileSize: p.size,
-          }));
-        }
-      } else {
-        const errJson = await splitRes.json().catch(() => ({}));
-        const specificErr = errJson.error || 'Server could not process this video stream.';
-        console.warn('Backend process-and-split returned error:', specificErr);
-        setIsLoadingVideo(false);
-        setBackendErrorModal(specificErr);
-        return;
+      if (!createRes.ok) {
+        const errJson = await createRes.json().catch(() => ({}));
+        throw new Error(errJson.error || 'Failed to submit processing job.');
       }
+
+      const createData = await createRes.json();
+      const jobId = createData.jobId;
+      setActiveJobId(jobId);
+
+      // Start Polling loop
+      pollIntervalRef.current = setInterval(async () => {
+        try {
+          const jobRes = await fetch(`/api/jobs/${jobId}`);
+          if (!jobRes.ok) return;
+
+          const job = await jobRes.json();
+          if (job.progress !== undefined) {
+            setLoadingPercent(job.progress);
+          }
+          if (job.phaseDescription) {
+            setLoadingPhase(job.phaseDescription);
+          }
+
+          if (job.status === 'completed') {
+            stopPolling();
+            setIsLoadingVideo(false);
+
+            if (Array.isArray(job.clips) && job.clips.length > 0) {
+              const formattedClips: ClipSegment[] = job.clips.map((p: any) => ({
+                id: p.id || `clip_${p.index}`,
+                title: p.title || `Clip ${p.index}`,
+                startTime: p.startTime,
+                endTime: p.endTime,
+                duration: p.duration,
+                serverClipUrl: p.streamUrl,
+                thumbnailUrl: p.thumbnailUrl,
+                fileSize: p.size,
+              }));
+
+              const newMeta: VideoMetadata = {
+                id: jobId,
+                type: config.videoSource.type,
+                title: job.sourceTitle || title,
+                url,
+                duration: job.sourceDuration || duration,
+                thumbnailUrl: config.videoSource.meta?.thumbnailUrl,
+                aspectRatio: config.orientation === '9:16' ? '9:16' : config.orientation === '1:1' ? '1:1' : '16:9',
+                resolution: config.quality === '4k' ? '4K Ultra HD (2160p)' : `${config.quality.toUpperCase()} HD`,
+                is4K: config.quality === '4k',
+                sessionId: jobId,
+              };
+
+              setVideoMeta(newMeta);
+              setClips(formattedClips);
+              window.scrollTo({ top: 0, behavior: 'instant' });
+              setCurrentScreen('workspace');
+            } else {
+              setBackendErrorModal('Job completed but no video clips were produced.');
+            }
+          } else if (job.status === 'failed') {
+            stopPolling();
+            setIsLoadingVideo(false);
+            setBackendErrorModal(job.error || 'Video processing encountered an error.');
+          } else if (job.status === 'cancelled') {
+            stopPolling();
+            setIsLoadingVideo(false);
+          }
+        } catch (e) {
+          console.warn('Job polling error:', e);
+        }
+      }, 800);
     } catch (e: unknown) {
-      console.warn('Backend process-and-split connection error:', e);
+      stopPolling();
       setIsLoadingVideo(false);
-      setBackendErrorModal(e instanceof Error ? e.message : 'Server connection error. Please upload your video file directly.');
-      return;
+      setBackendErrorModal(e instanceof Error ? e.message : 'Server connection error.');
     }
+  };
 
-    // If server trimming succeeded, go to workspace
-    if (serverParts.length > 0) {
-      setLoadingPhase('Done! Opening trimmed workspace...');
-      setLoadingPercent(100);
-
-      const newMeta: VideoMetadata = {
-        id: `vid_${Date.now()}`,
-        type: config.videoSource.type,
-        title,
-        url,
-        duration,
-        thumbnailUrl: config.videoSource.meta?.thumbnailUrl,
-        aspectRatio: config.platform === 'shorts' || config.platform === 'tiktok' ? '9:16' : '16:9',
-        resolution: config.quality === '4k' ? '4K Ultra HD (2160p)' : '1080p Full HD',
-        is4K: config.quality === '4k',
-        sessionId,
-      };
-
-      setTimeout(() => {
-        setVideoMeta(newMeta);
-        setClips(serverParts);
-        setIsLoadingVideo(false);
-        window.scrollTo({ top: 0, behavior: 'instant' });
-        setCurrentScreen('workspace');
-      }, 400);
-      return;
+  const handleCancelJob = async () => {
+    if (activeJobId) {
+      try {
+        await fetch(`/api/jobs/${activeJobId}/cancel`, { method: 'POST' });
+      } catch {}
     }
-
+    stopPolling();
     setIsLoadingVideo(false);
-    setBackendErrorModal(
-      'Could not generate genuine trimmed video parts for this input. Please select a video file to upload directly for instant 100% guaranteed FFmpeg slicing.'
-    );
+    setActiveJobId(null);
   };
 
   const handleBackToSetup = () => {
+    stopPolling();
     if (videoMeta.sessionId) {
       try {
         fetch('/api/cleanup-session', {
@@ -217,7 +254,7 @@ export default function App() {
         </main>
       )}
 
-      {/* SCREEN 2: Clean Studio Workspace with Playable Trimmed Parts */}
+      {/* SCREEN 2: Studio Workspace with Playable Sliced Parts */}
       {currentScreen === 'workspace' && (
         <main className="flex-1">
           <CleanWorkspaceView
@@ -232,7 +269,7 @@ export default function App() {
 
       {/* Real-time Video Download & Trimming Modal */}
       {isLoadingVideo && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl text-center space-y-5">
             <div className="w-16 h-16 mx-auto rounded-2xl bg-gradient-to-tr from-red-600 to-amber-500 flex items-center justify-center text-white shadow-lg shadow-red-500/30">
               <Scissors className="w-8 h-8 animate-pulse -rotate-45" />
@@ -240,9 +277,9 @@ export default function App() {
 
             <div className="space-y-1.5">
               <h3 className="text-lg font-bold text-white tracking-tight">
-                Downloading & Trimming Video
+                Processing &amp; Slicing Video
               </h3>
-              <p className="text-xs text-slate-400">
+              <p className="text-xs text-slate-400 leading-relaxed font-mono">
                 {loadingPhase}
               </p>
             </div>
@@ -252,11 +289,11 @@ export default function App() {
               <div className="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
                 <div
                   className="bg-gradient-to-r from-red-500 via-amber-500 to-emerald-500 h-full rounded-full transition-all duration-300"
-                  style={{ width: `${loadingPercent}%` }}
+                  style={{ width: `${Math.min(100, Math.max(5, loadingPercent))}%` }}
                 />
               </div>
               <div className="flex justify-between text-[11px] font-mono text-slate-400">
-                <span>Processing parts</span>
+                <span>FFmpeg Segmentation Engine</span>
                 <span className="text-emerald-400 font-semibold">{loadingPercent}%</span>
               </div>
             </div>
@@ -265,8 +302,20 @@ export default function App() {
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800/80 text-left flex items-start gap-2.5 text-xs text-slate-400">
               <HardDrive className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
               <span>
-                <strong>Smart Storage:</strong> Full source video is removed immediately after trimming to keep server lightweight.
+                <strong>Smart Storage:</strong> Slices are encoded directly and source footage is released after processing to prevent server bloat.
               </span>
+            </div>
+
+            {/* Cancel Button */}
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={handleCancelJob}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-semibold transition-colors cursor-pointer"
+              >
+                <XCircle className="w-4 h-4 text-rose-400" />
+                <span>Cancel Processing</span>
+              </button>
             </div>
           </div>
         </div>
@@ -274,7 +323,7 @@ export default function App() {
 
       {/* Backend / Video Stream Guidance Dialog */}
       {backendErrorModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-7 max-w-md w-full shadow-2xl text-center space-y-5">
             <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
               <AlertTriangle className="w-7 h-7" />
@@ -282,7 +331,7 @@ export default function App() {
 
             <div className="space-y-2">
               <h3 className="text-base sm:text-lg font-bold text-white">
-                Video Trimming Notice
+                Video Processing Notice
               </h3>
               <p className="text-xs text-slate-300 text-left leading-relaxed">
                 {backendErrorModal}
@@ -290,6 +339,20 @@ export default function App() {
             </div>
 
             <div className="space-y-2.5 pt-1">
+              {/* If user provided a YouTube URL, offer direct device download helper */}
+              {extractYouTubeId(lastAttemptedUrl) && (
+                <a
+                  href={`https://ssyoutube.com/watch?v=${extractYouTubeId(lastAttemptedUrl)}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-red-600 hover:bg-red-500 text-white rounded-xl text-xs font-bold transition-all shadow-lg shadow-red-600/20"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download Video to Device First (Free)</span>
+                  <ExternalLink className="w-3 h-3 ml-0.5 opacity-80" />
+                </a>
+              )}
+
               <button
                 type="button"
                 onClick={() => {

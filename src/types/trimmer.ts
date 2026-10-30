@@ -62,11 +62,32 @@ export interface SplitPreset {
   iconName?: string;
 }
 
-export interface ExportProgress {
-  clipId: string;
+export type OutputOrientation = 'original' | '9:16' | '16:9' | '1:1';
+
+export type JobProcessingStatus =
+  | 'idle'
+  | 'validating'
+  | 'preparing'
+  | 'queued'
+  | 'processing'
+  | 'finalizing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface ProcessingJob {
+  id: string;
+  status: JobProcessingStatus;
   progress: number; // 0 to 100
-  status: 'idle' | 'rendering' | 'ready' | 'error';
-  errorMessage?: string;
-  downloadUrl?: string;
-  blobSize?: number;
+  phaseDescription: string;
+  currentClipIndex: number;
+  totalClips: number;
+  sourceTitle: string;
+  sourceDuration: number;
+  sliceSeconds: number;
+  orientation: OutputOrientation;
+  quality: VideoQuality;
+  clips: ClipSegment[];
+  error?: string;
+  createdAt: number;
 }

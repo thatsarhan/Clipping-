@@ -163,7 +163,7 @@ export const NativeVideoClipCard: React.FC<NativeVideoClipCardProps> = ({
         <div>
           <div className="flex items-center gap-2">
             <h3 className="text-base sm:text-lg font-bold text-white tracking-tight">
-              Part {index + 1}
+              Clip {String(index + 1).padStart(2, '0')}
             </h3>
             <span className="px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold uppercase tracking-wider">
               Trimmed MP4

@@ -96,7 +96,18 @@ export function parseTimestamp(str: string): number {
 }
 
 /**
- * Automatically splits a video duration into equal parts (e.g. 2 minutes = 120s)
+ * Accurately calculates clip count based on formula:
+ * clipCount = ceil(videoDurationSeconds / clipDurationSeconds)
+ */
+export function calculateClipCount(totalDuration: number, segmentDurationSeconds: number): number {
+  if (!totalDuration || totalDuration <= 0) return 0;
+  if (!segmentDurationSeconds || segmentDurationSeconds <= 0) return 0;
+  return Math.max(1, Math.ceil(totalDuration / segmentDurationSeconds));
+}
+
+/**
+ * Automatically splits a video duration into consecutive equal parts (e.g. 10s, 15s, 30s, 45s, 60s)
+ * The final clip preserves remaining footage without exceeding total duration.
  */
 export function generateEqualSegments(
   totalDuration: number,
@@ -110,8 +121,8 @@ export function generateEqualSegments(
   if (!totalDuration || totalDuration <= 0) return [];
   if (!segmentDurationSeconds || segmentDurationSeconds <= 0) return [];
 
-  const prefix = options?.titlePrefix || 'Part';
-  const max = options?.maxSegments || 100;
+  const prefix = options?.titlePrefix || 'Clip';
+  const max = options?.maxSegments || 200;
   const defaultColors = [
     '#3B82F6', // Blue
     '#10B981', // Emerald
@@ -132,22 +143,15 @@ export function generateEqualSegments(
     const currentEnd = Math.min(totalDuration, currentStart + segmentDurationSeconds);
     const duration = Math.round((currentEnd - currentStart) * 10) / 10;
 
-    // Skip segments shorter than 1.5 seconds if it's a tiny tail, or merge into previous if very small
-    if (duration < 1.5 && segments.length > 0) {
-      const prev = segments[segments.length - 1];
-      prev.endTime = currentEnd;
-      prev.duration = Math.round((prev.endTime - prev.startTime) * 10) / 10;
-      prev.title = `${prefix} ${segments.length} (${formatTimestamp(prev.startTime)} - ${formatTimestamp(prev.endTime)})`;
-      break;
-    }
-
-    const id = `clip_${Date.now()}_${partIndex}`;
+    // Pad clip number: "Clip 01", "Clip 02", etc.
+    const clipNumStr = partIndex.toString().padStart(2, '0');
+    const id = `clip_${partIndex}_${Math.round(currentStart)}`;
     const startFmt = formatTimestamp(currentStart);
     const endFmt = formatTimestamp(currentEnd);
 
     segments.push({
       id,
-      title: `${prefix} ${partIndex} (${startFmt} - ${endFmt})`,
+      title: `${prefix} ${clipNumStr} (${startFmt} – ${endFmt})`,
       startTime: Math.round(currentStart * 10) / 10,
       endTime: Math.round(currentEnd * 10) / 10,
       duration,

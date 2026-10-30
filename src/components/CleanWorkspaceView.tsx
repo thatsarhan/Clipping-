@@ -27,7 +27,17 @@ export const CleanWorkspaceView: React.FC<CleanWorkspaceViewProps> = ({
     setIsZippingAll(true);
     setZipProgress(10);
     try {
-      await downloadAllClipsZip(videoMeta, clips, (p) => setZipProgress(p));
+      if (videoMeta.sessionId && videoMeta.sessionId.startsWith('job_')) {
+        // Direct high-speed server ZIP endpoint
+        const link = document.createElement('a');
+        link.href = `/api/jobs/${videoMeta.sessionId}/zip`;
+        link.setAttribute('download', `${(videoMeta.title || 'Clips').replace(/[^a-zA-Z0-9_-]/g, '_')}_Clips.zip`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } else {
+        await downloadAllClipsZip(videoMeta, clips, (p) => setZipProgress(p));
+      }
     } catch (e) {
       console.error(e);
     } finally {

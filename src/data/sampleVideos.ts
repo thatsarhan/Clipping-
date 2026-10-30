@@ -2,6 +2,17 @@ import { VideoMetadata } from '../types/trimmer';
 
 export const SAMPLE_VIDEOS: VideoMetadata[] = [
   {
+    id: 'sample_local_test',
+    type: 'sample',
+    title: 'ClipCraft 4K Studio Color & Audio Reference (15s Instant Demo)',
+    author: 'ClipCraft Engine',
+    url: '/demo-sample.mp4',
+    duration: 15,
+    thumbnailUrl: 'https://images.unsplash.com/photo-1574717024653-61fd2cf4d44d?auto=format&fit=crop&w=640&q=80',
+    aspectRatio: '16:9',
+    is4K: true,
+  },
+  {
     id: 'sample_bunny',
     type: 'sample',
     title: 'Big Buck Bunny (60fps High-Definition Master)',

@@ -11,7 +11,7 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(express.raw({ type: 'application/octet-stream', limit: '500mb' }));
 
-const YTDLP_PATH = '/usr/local/bin/yt-dlp';
+const YTDLP_BIN = path.join(process.cwd(), 'bin', 'yt-dlp');
 const CACHE_DIR = path.join(os.tmpdir(), 'clipcraft_cache');
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -122,8 +122,8 @@ app.get('/api/video-info', async (req: Request, res: Response) => {
   }
 
   execFile(
-    YTDLP_PATH,
-    ['--skip-download', '--dump-json', '--no-warnings', videoUrl],
+    'python3',
+    [YTDLP_BIN, '--skip-download', '--dump-json', '--no-warnings', videoUrl],
     { maxBuffer: 10 * 1024 * 1024, timeout: 6000 },
     (error, stdout) => {
       if (!error && stdout) {
@@ -219,7 +219,7 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
     }
 
     // YouTube URL -> High-compatibility download using autoclip player_client args
-    const ytCmd = `yt-dlp --js-runtimes node:/usr/local/bin/node --extractor-args "youtube:player_client=android,web,tv" -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best" --merge-output-format mp4 --no-playlist --no-warnings "${url}" -o "${rawTempVideo}"`;
+    const ytCmd = `python3 "${YTDLP_BIN}" --js-runtimes node:/usr/local/bin/node --extractor-args "youtube:player_client=android,web,tv" -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best" --merge-output-format mp4 --no-playlist --no-warnings "${url}" -o "${rawTempVideo}"`;
     exec(ytCmd, { maxBuffer: 50 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
       let candidate: string | null = null;
       if (fs.existsSync(rawTempVideo) && fs.statSync(rawTempVideo).size > 10000) {
@@ -235,10 +235,10 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
       if (candidate) {
         onDownloaded(null, candidate);
       } else {
-        const fullErr = (err?.message || '') + ' ' + (stderr || '');
+        const fullErr = (err?.message || '') + ' ' + (stderr || '') + ' ' + (stdout || '');
         let friendlyErr = 'Could not download video stream from link.';
-        if (fullErr.includes('Sign in to confirm you’re not a bot') || fullErr.includes('bot')) {
-          friendlyErr = 'YouTube blocked automated cloud downloading on this server IP ("Sign in to confirm you are not a bot"). Please upload your video file directly using the "Upload Video" tab for instant 100% genuine FFmpeg trimming.';
+        if (fullErr.includes('Sign in to confirm you’re not a bot') || fullErr.includes('bot') || fullErr.includes('LOGIN_REQUIRED')) {
+          friendlyErr = 'YouTube requires sign-in verification on cloud server IPs ("Sign in to confirm you are not a bot"). Please save the video to your device first, then upload it below for 100% genuine FFmpeg trimming.';
         }
         onDownloaded(new Error(friendlyErr), null);
       }
@@ -338,6 +338,405 @@ app.post('/api/process-and-split', async (req: Request, res: Response) => {
       }
     );
   });
+});
+
+// -------------------------------------------------------------
+// ASYNCHRONOUS JOB SYSTEM FOR VIDEO PROCESSING
+// Prevents request timeouts and provides live progress tracking
+// -------------------------------------------------------------
+interface JobItem {
+  id: string;
+  status: 'validating' | 'preparing' | 'queued' | 'processing' | 'finalizing' | 'completed' | 'failed' | 'cancelled';
+  progress: number;
+  phaseDescription: string;
+  currentClipIndex: number;
+  totalClips: number;
+  sourceTitle: string;
+  sourceDuration: number;
+  sliceSeconds: number;
+  orientation: 'original' | '9:16' | '16:9' | '1:1';
+  quality: string;
+  sessionDir: string;
+  clips: {
+    id: string;
+    index: number;
+    title: string;
+    startTime: number;
+    endTime: number;
+    duration: number;
+    downloadUrl: string;
+    streamUrl: string;
+    thumbnailUrl: string;
+    size: number;
+  }[];
+  error?: string;
+  createdAt: number;
+  isCancelled?: boolean;
+}
+
+const activeJobs = new Map<string, JobItem>();
+
+// Helper to build orientation filter for FFmpeg
+function getOrientationFilter(orientation: string): string {
+  switch (orientation) {
+    case '9:16':
+      return '-vf "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,format=yuv420p" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero';
+    case '16:9':
+      return '-vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero';
+    case '1:1':
+      return '-vf "scale=720:720:force_original_aspect_ratio=increase,crop=720:720,format=yuv420p" -c:v libx264 -preset ultrafast -crf 23 -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero';
+    case 'original':
+    default:
+      return '-c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart -avoid_negative_ts make_zero';
+  }
+}
+
+// Background Worker to process async video job
+async function runAsyncJobWorker(job: JobItem, url: string) {
+  try {
+    const rawTempVideo = path.join(job.sessionDir, 'source_raw.mp4');
+
+    // Phase 1: Validating & Preparing Source
+    job.status = 'preparing';
+    job.phaseDescription = 'Acquiring video source...';
+    job.progress = 10;
+
+    let sourcePath: string | null = null;
+    let candidatePath = url;
+    if (url.startsWith('/') && !fs.existsSync(url)) {
+      const publicPath = path.join(process.cwd(), 'public', url);
+      if (fs.existsSync(publicPath)) {
+        candidatePath = publicPath;
+      }
+    } else if (url.startsWith('public/')) {
+      const fullPath = path.join(process.cwd(), url);
+      if (fs.existsSync(fullPath)) {
+        candidatePath = fullPath;
+      }
+    }
+
+    if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile()) {
+      sourcePath = candidatePath;
+    } else if (url.startsWith('http') && (url.includes('.mp4') || url.includes('.webm') || url.includes('archive.org'))) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status} when fetching video stream`);
+      const buf = await res.arrayBuffer();
+      fs.writeFileSync(rawTempVideo, Buffer.from(buf));
+      sourcePath = rawTempVideo;
+    } else {
+      // YouTube URL
+      const ytCmd = `python3 "${YTDLP_BIN}" --js-runtimes node:/usr/local/bin/node --extractor-args "youtube:player_client=android,web,tv" -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best" --merge-output-format mp4 --no-playlist --no-warnings "${url}" -o "${rawTempVideo}"`;
+      await new Promise<void>((resolve, reject) => {
+        exec(ytCmd, { maxBuffer: 50 * 1024 * 1024, timeout: 60000 }, (err, stdout, stderr) => {
+          if (fs.existsSync(rawTempVideo) && fs.statSync(rawTempVideo).size > 10000) {
+            sourcePath = rawTempVideo;
+            return resolve();
+          }
+          const files = fs.readdirSync(job.sessionDir);
+          const match = files.find((f) => (f.startsWith('source_raw') || f.endsWith('.mp4')) && !f.endsWith('.part'));
+          if (match) {
+            sourcePath = path.join(job.sessionDir, match);
+            return resolve();
+          }
+
+          const fullErr = (err?.message || '') + ' ' + (stderr || '') + ' ' + (stdout || '');
+          let friendlyErr = 'Could not download video stream from link.';
+          if (fullErr.includes('Sign in to confirm you’re not a bot') || fullErr.includes('bot') || fullErr.includes('LOGIN_REQUIRED')) {
+            friendlyErr = 'YouTube requires sign-in verification on cloud server IPs ("Sign in to confirm you are not a bot"). Please save the video to your device first, then upload it below for 100% genuine FFmpeg trimming.';
+          }
+          reject(new Error(friendlyErr));
+        });
+      });
+    }
+
+    if (job.isCancelled) return;
+    if (!sourcePath || !fs.existsSync(sourcePath)) {
+      throw new Error('Video source file not found or inaccessible.');
+    }
+
+    // Phase 2: Probe Duration
+    job.phaseDescription = 'Probing video dimensions and stream duration...';
+    job.progress = 25;
+
+    const probeStdout = await new Promise<string>((resolve) => {
+      exec(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${sourcePath}"`,
+        (err, out) => resolve(out ? out.trim() : '')
+      );
+    });
+
+    let totalDuration = 300;
+    if (probeStdout) {
+      const parsed = parseFloat(probeStdout);
+      if (!isNaN(parsed) && parsed > 0) totalDuration = Math.round(parsed);
+    }
+    job.sourceDuration = totalDuration;
+
+    // Calculate exact clip count: ceil(totalDuration / sliceSeconds)
+    const totalClips = Math.max(1, Math.ceil(totalDuration / Math.max(1, job.sliceSeconds)));
+    job.totalClips = totalClips;
+
+    // Phase 3: Slicing video into consecutive parts
+    job.status = 'processing';
+    job.phaseDescription = `Dividing video into ${totalClips} consecutive clips...`;
+
+    const orientationArgs = getOrientationFilter(job.orientation);
+
+    for (let i = 0; i < totalClips; i++) {
+      if (job.isCancelled) return;
+
+      const start = i * job.sliceSeconds;
+      const end = Math.min(totalDuration, (i + 1) * job.sliceSeconds);
+      const partDur = Math.round((end - start) * 10) / 10;
+      const partFile = path.join(job.sessionDir, `part_${i + 1}.mp4`);
+      const thumbFile = path.join(job.sessionDir, `part_${i + 1}_thumb.jpg`);
+      const startStr = formatTime(start);
+
+      job.currentClipIndex = i + 1;
+      job.phaseDescription = `Encoding Clip ${i + 1} of ${totalClips} (${formatTime(start)} – ${formatTime(end)})...`;
+      job.progress = Math.round(25 + ((i + 1) / totalClips) * 65);
+
+      const sliceCmd = `ffmpeg -ss ${startStr} -i "${sourcePath}" -t ${partDur} -map 0:v:0 -map 0:a:0? ${orientationArgs} -y "${partFile}"`;
+
+      await new Promise<void>((resolve) => {
+        exec(sliceCmd, () => {
+          if (fs.existsSync(partFile) && fs.statSync(partFile).size > 1000) {
+            const thumbSec = partDur > 1 ? '00:00:01' : '00:00:00';
+            exec(`ffmpeg -ss ${thumbSec} -i "${partFile}" -vframes 1 -vf "scale=480:-1" -y "${thumbFile}"`, () => resolve());
+          } else {
+            resolve();
+          }
+        });
+      });
+
+      if (fs.existsSync(partFile) && fs.statSync(partFile).size > 1000) {
+        const clipNum = (i + 1).toString().padStart(2, '0');
+        job.clips.push({
+          id: `clip_${i + 1}`,
+          index: i + 1,
+          title: `Clip ${clipNum} (${formatTime(start)} – ${formatTime(end)})`,
+          startTime: start,
+          endTime: end,
+          duration: partDur,
+          downloadUrl: `/api/jobs/${job.id}/clips/${i + 1}?download=1`,
+          streamUrl: `/api/jobs/${job.id}/clips/${i + 1}`,
+          thumbnailUrl: `/api/jobs/${job.id}/clips/${i + 1}/thumb`,
+          size: fs.statSync(partFile).size,
+        });
+      }
+    }
+
+    if (job.isCancelled) return;
+
+    // Phase 4: Finalizing & Cleaning up raw source
+    job.status = 'finalizing';
+    job.phaseDescription = 'Finalizing clips and freeing server storage...';
+    job.progress = 95;
+
+    try {
+      if (fs.existsSync(sourcePath) && (sourcePath.includes(CACHE_DIR) || sourcePath.includes('source_raw') || sourcePath.includes('user_'))) {
+        fs.unlinkSync(sourcePath);
+      }
+    } catch {}
+
+    // Phase 5: Completed!
+    job.status = 'completed';
+    job.progress = 100;
+    job.phaseDescription = `Successfully generated ${job.clips.length} clips!`;
+  } catch (err: unknown) {
+    if (!job.isCancelled) {
+      job.status = 'failed';
+      job.error = err instanceof Error ? err.message : 'Video processing failed.';
+      job.phaseDescription = 'Processing stopped.';
+    }
+  }
+}
+
+// 1. Create a background processing job
+app.post('/api/jobs/create', (req: Request, res: Response) => {
+  const { url, sliceSeconds = 30, orientation = '9:16', quality = '4k', title = 'Video' } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: 'Video URL or uploaded path is required.' });
+  }
+
+  const durationSec = Math.max(5, Math.min(3600, parseInt(sliceSeconds, 10) || 30));
+  const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const sessionDir = path.join(CACHE_DIR, jobId);
+
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
+  }
+
+  const job: JobItem = {
+    id: jobId,
+    status: 'validating',
+    progress: 5,
+    phaseDescription: 'Validating video source and options...',
+    currentClipIndex: 0,
+    totalClips: 0,
+    sourceTitle: title,
+    sourceDuration: 0,
+    sliceSeconds: durationSec,
+    orientation: orientation || '9:16',
+    quality: quality || '4k',
+    sessionDir,
+    clips: [],
+    createdAt: Date.now(),
+  };
+
+  activeJobs.set(jobId, job);
+
+  // Run in background without blocking response
+  runAsyncJobWorker(job, url);
+
+  res.json({
+    jobId,
+    status: job.status,
+    message: 'Job submitted successfully',
+  });
+});
+
+// 2. Poll job status
+app.get('/api/jobs/:id', (req: Request, res: Response) => {
+  const job = activeJobs.get(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found or expired.' });
+  }
+  res.json({
+    id: job.id,
+    status: job.status,
+    progress: job.progress,
+    phaseDescription: job.phaseDescription,
+    currentClipIndex: job.currentClipIndex,
+    totalClips: job.totalClips,
+    sourceTitle: job.sourceTitle,
+    sourceDuration: job.sourceDuration,
+    sliceSeconds: job.sliceSeconds,
+    orientation: job.orientation,
+    quality: job.quality,
+    clips: job.clips,
+    error: job.error,
+    createdAt: job.createdAt,
+  });
+});
+
+// 3. Cancel running job
+app.post('/api/jobs/:id/cancel', (req: Request, res: Response) => {
+  const job = activeJobs.get(req.params.id);
+  if (job) {
+    job.isCancelled = true;
+    job.status = 'cancelled';
+    job.phaseDescription = 'Job cancelled by user.';
+    try {
+      if (fs.existsSync(job.sessionDir)) {
+        fs.rmSync(job.sessionDir, { recursive: true, force: true });
+      }
+    } catch {}
+    activeJobs.delete(req.params.id);
+  }
+  res.json({ success: true, message: 'Job cancelled' });
+});
+
+// 4. Stream or download real clip
+app.get('/api/jobs/:id/clips/:index', (req: Request, res: Response) => {
+  const { id, index } = req.params;
+  const isDownload = req.query.download === '1' || req.query.download === 'true';
+  const filePath = path.join(CACHE_DIR, id, `part_${index}.mp4`);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: `Clip ${index} file not found or expired.` });
+  }
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const safeFilename = `Clip_${index.padStart(2, '0')}.mp4`;
+
+  if (isDownload) {
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Content-Type', 'video/mp4');
+    return res.download(filePath, safeFilename);
+  }
+
+  const range = req.headers.range;
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = end - start + 1;
+    const file = fs.createReadStream(filePath, { start, end });
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'video/mp4',
+    });
+    file.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Content-Type': 'video/mp4',
+      'Accept-Ranges': 'bytes',
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
+// 5. Get extracted frame thumbnail
+app.get('/api/jobs/:id/clips/:index/thumb', (req: Request, res: Response) => {
+  const { id, index } = req.params;
+  const thumbPath = path.join(CACHE_DIR, id, `part_${index}_thumb.jpg`);
+
+  if (fs.existsSync(thumbPath)) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    return res.sendFile(thumbPath);
+  }
+  res.status(404).json({ error: 'Thumbnail not found' });
+});
+
+// 6. Download ZIP of all completed clips in job
+app.get('/api/jobs/:id/zip', async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const sessionDir = path.join(CACHE_DIR, id);
+
+  if (!fs.existsSync(sessionDir)) {
+    return res.status(404).json({ error: 'Job session expired or not found.' });
+  }
+
+  try {
+    const JSZipModule = (await import('jszip')).default;
+    const zip = new JSZipModule();
+    const files = fs.readdirSync(sessionDir);
+    const partFiles = files.filter((f) => f.startsWith('part_') && f.endsWith('.mp4'));
+
+    if (partFiles.length === 0) {
+      return res.status(404).json({ error: 'No video clips available in job.' });
+    }
+
+    for (const f of partFiles) {
+      zip.file(f, fs.readFileSync(path.join(sessionDir, f)));
+    }
+
+    const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const safeZipName = `ClipCraft_${id}_all_clips.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeZipName}"`);
+    res.send(zipBuffer);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create ZIP package' });
+  }
+});
+
+// 7. Endpoint to export full project source ZIP
+app.get('/api/download-project-source', (req: Request, res: Response) => {
+  const zipPath = path.join(process.cwd(), 'public', 'ClipCraft-Project-Source.zip');
+  if (fs.existsSync(zipPath)) {
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="ClipCraft-Project-Source.zip"');
+    return res.sendFile(zipPath);
+  }
+  res.status(404).json({ error: 'Project archive not generated yet' });
 });
 
 // -------------------------------------------------------------
@@ -473,10 +872,7 @@ app.post('/api/upload-video', (req: Request, res: Response) => {
   const safeName = filename.replace(/[^a-zA-Z0-9_.-]/g, '_');
   const targetPath = path.join(CACHE_DIR, `user_${Date.now()}_${safeName}`);
 
-  const writeStream = fs.createWriteStream(targetPath);
-  req.pipe(writeStream);
-
-  writeStream.on('finish', () => {
+  const handleSavedFile = () => {
     exec(
       `ffprobe -v error -show_entries format=duration:stream=width,height -of default=noprint_wrappers=1 "${targetPath}"`,
       (err, stdout) => {
@@ -492,17 +888,29 @@ app.post('/api/upload-video', (req: Request, res: Response) => {
           if (w >= 3840 || h >= 2160) is4K = true;
         }
 
+        const size = fs.existsSync(targetPath) ? fs.statSync(targetPath).size : 0;
         res.json({
           url: targetPath,
           title: safeName.replace(/\.[^/.]+$/, ''),
           duration,
           is4K,
-          size: fs.statSync(targetPath).size,
+          size,
         });
       }
     );
-  });
+  };
 
+  // If express.raw parsed the stream into a Buffer
+  if (Buffer.isBuffer(req.body) && req.body.length > 0) {
+    fs.writeFileSync(targetPath, req.body);
+    return handleSavedFile();
+  }
+
+  // Fallback to stream piping if body was not buffered
+  const writeStream = fs.createWriteStream(targetPath);
+  req.pipe(writeStream);
+
+  writeStream.on('finish', handleSavedFile);
   writeStream.on('error', (err) => {
     res.status(500).json({ error: 'File upload failed', details: err.message });
   });

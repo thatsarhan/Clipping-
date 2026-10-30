@@ -29,6 +29,18 @@ export const Header: React.FC<HeaderProps> = ({ onReset }) => {
             </p>
           </div>
         </div>
+
+        {/* Action Buttons: Source Code Export */}
+        <div className="flex items-center gap-3">
+          <a
+            href="/api/download-project-source"
+            download="ClipCraft-Project-Source.zip"
+            className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-xs font-semibold text-slate-200 hover:text-white transition-all shadow-sm cursor-pointer"
+            title="Download complete project source code ZIP"
+          >
+            <span>📦 Source Code (.ZIP)</span>
+          </a>
+        </div>
       </div>
     </header>
   );
